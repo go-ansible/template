@@ -1,0 +1,234 @@
+package template
+
+import (
+	"reflect"
+	"testing"
+)
+
+func TestRenderBasic(t *testing.T) {
+	e := New()
+	out, err := e.Render("hello {{ name }}!", map[string]any{"name": "world"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "hello world!" {
+		t.Fatalf("got %q", out)
+	}
+}
+
+func TestWholeExpressionPreservesType(t *testing.T) {
+	e := New()
+	cases := []struct {
+		name string
+		tmpl string
+		vars map[string]any
+		want any
+	}{
+		{"int", "{{ n }}", map[string]any{"n": 42}, 42},
+		{"bool", "{{ b }}", map[string]any{"b": true}, true},
+		{"list", "{{ l }}", map[string]any{"l": []any{1, 2, 3}}, []any{1, 2, 3}},
+		{"dict", "{{ d }}", map[string]any{"d": map[string]any{"a": 1}}, map[string]any{"a": int64(1)}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := e.RenderValue(c.tmpl, c.vars)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(normalizeInts(got), normalizeInts(c.want)) {
+				t.Errorf("RenderValue(%q) = %#v (%T), want %#v (%T)", c.tmpl, got, got, c.want, c.want)
+			}
+		})
+	}
+}
+
+// normalizeInts collapses int/int64/float64 differences so tests focus
+// on value equality, not gonja's specific numeric representation.
+func normalizeInts(v any) any {
+	switch t := v.(type) {
+	case int:
+		return float64(t)
+	case int64:
+		return float64(t)
+	case []any:
+		out := make([]any, len(t))
+		for i, e := range t {
+			out[i] = normalizeInts(e)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, e := range t {
+			out[k] = normalizeInts(e)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+func TestMixedStringStaysString(t *testing.T) {
+	e := New()
+	got, err := e.RenderValue("count={{ n }}", map[string]any{"n": 42})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "count=42" {
+		t.Fatalf("got %#v, want string \"count=42\"", got)
+	}
+}
+
+func TestRenderValueRecursesIntoStructures(t *testing.T) {
+	e := New()
+	in := map[string]any{
+		"greeting": "hi {{ name }}",
+		"nested": []any{
+			map[string]any{"x": "{{ n }}"},
+		},
+	}
+	got, err := e.RenderValue(in, map[string]any{"name": "bob", "n": 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := got.(map[string]any)
+	if m["greeting"] != "hi bob" {
+		t.Fatalf("greeting = %v", m["greeting"])
+	}
+	nested := m["nested"].([]any)[0].(map[string]any)
+	if nested["x"] != 7 {
+		t.Fatalf("nested x = %#v, want 7", nested["x"])
+	}
+}
+
+func TestEvalBoolForWhen(t *testing.T) {
+	e := New()
+	cases := []struct {
+		expr string
+		vars map[string]any
+		want bool
+	}{
+		{"x == 1", map[string]any{"x": 1}, true},
+		{"x == 1", map[string]any{"x": 2}, false},
+		{"x is defined", map[string]any{"x": 1}, true},
+		{"y is not defined", map[string]any{"x": 1}, true},
+		{"x and y", map[string]any{"x": true, "y": false}, false},
+		{"x or y", map[string]any{"x": false, "y": true}, true},
+		{"not x", map[string]any{"x": false}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.expr, func(t *testing.T) {
+			got, err := e.EvalBool(c.expr, c.vars)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != c.want {
+				t.Errorf("EvalBool(%q) = %v, want %v", c.expr, got, c.want)
+			}
+		})
+	}
+}
+
+func TestDefaultFilter(t *testing.T) {
+	e := New()
+	got, err := e.Render("{{ missing | default('fallback') }}", map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "fallback" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestAnsibleFilters(t *testing.T) {
+	e := New()
+	cases := []struct {
+		name string
+		tmpl string
+		vars map[string]any
+		want string
+	}{
+		{"to_json", `{{ d | to_json }}`, map[string]any{"d": map[string]any{"a": 1}}, `{"a":1}`},
+		{"regex_replace", `{{ 'hello world' | regex_replace('world', 'there') }}`, nil, "hello there"},
+		{"regex_replace backref", `{{ 'foo123' | regex_replace('foo(\\d+)', 'bar\\1') }}`, nil, "bar123"},
+		{"basename", `{{ '/a/b/c.txt' | basename }}`, nil, "c.txt"},
+		{"dirname", `{{ '/a/b/c.txt' | dirname }}`, nil, "/a/b"},
+		{"b64encode", `{{ 'hi' | b64encode }}`, nil, "aGk="},
+		{"b64decode", `{{ 'aGk=' | b64decode }}`, nil, "hi"},
+		{"ternary true", `{{ true | ternary('yes', 'no') }}`, nil, "yes"},
+		{"ternary false", `{{ false | ternary('yes', 'no') }}`, nil, "no"},
+		{"bool yes", `{{ 'yes' | bool }}`, nil, "True"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := e.Render(c.tmpl, c.vars)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != c.want {
+				t.Errorf("Render(%q) = %q, want %q", c.tmpl, got, c.want)
+			}
+		})
+	}
+}
+
+func TestCombineFilter(t *testing.T) {
+	e := New()
+	got, err := e.RenderValue("{{ a | combine(b) }}", map[string]any{
+		"a": map[string]any{"x": 1, "y": 2},
+		"b": map[string]any{"y": 3, "z": 4},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := got.(map[string]any)
+	if m["x"] != 1 || m["y"] != 3 || m["z"] != 4 {
+		t.Fatalf("combine result = %#v", m)
+	}
+}
+
+func TestVersionTest(t *testing.T) {
+	e := New()
+	cases := []struct {
+		expr string
+		want bool
+	}{
+		{"'2.10.1' is version('2.9', '>=')", true},
+		{"'2.9.1' is version('2.10', '>=')", false},
+		{"'2.10.0' is version('2.10.0', '==')", true},
+	}
+	for _, c := range cases {
+		got, err := e.EvalBool(c.expr, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != c.want {
+			t.Errorf("EvalBool(%q) = %v, want %v", c.expr, got, c.want)
+		}
+	}
+}
+
+func TestResultTests(t *testing.T) {
+	e := New()
+	result := map[string]any{"changed": true, "failed": false, "rc": 0}
+	if got, _ := e.EvalBool("r is changed", map[string]any{"r": result}); !got {
+		t.Error("expected r is changed == true")
+	}
+	if got, _ := e.EvalBool("r is success", map[string]any{"r": result}); !got {
+		t.Error("expected r is success == true")
+	}
+	if got, _ := e.EvalBool("r is failed", map[string]any{"r": result}); got {
+		t.Error("expected r is failed == false")
+	}
+}
+
+func TestIsTemplate(t *testing.T) {
+	if !IsTemplate("{{ x }}") {
+		t.Error("{{ x }} should be a template")
+	}
+	if !IsTemplate("{% if x %}y{% endif %}") {
+		t.Error("{% if %} should be a template")
+	}
+	if IsTemplate("plain string") {
+		t.Error("plain string should not be a template")
+	}
+}
