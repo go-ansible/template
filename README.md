@@ -6,6 +6,23 @@ Part of [go-ansible](https://github.com/go-ansible) — a pure-Go (CGO=0),
 functional-parity port of [Ansible](https://www.ansible.com/).
 
 [![CI](https://github.com/go-ansible/template/actions/workflows/ci.yml/badge.svg)](https://github.com/go-ansible/template/actions/workflows/ci.yml)
-[![Go](https://img.shields.io/badge/go-1.26.4%2B-00ADD8)](https://go.dev/dl/)
 [![Go Reference](https://pkg.go.dev/badge/github.com/go-ansible/template.svg)](https://pkg.go.dev/github.com/go-ansible/template)
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
+
+## Usage
+
+```go
+eng := template.New()
+
+out, err := eng.Render("Hello {{ name | upper }}", map[string]any{"name": "world"})
+
+ok, err := eng.EvalBool("ansible_facts.os_family == 'Debian'", data) // when: conditions
+
+v, err := eng.RenderValue(rawYAMLValue, data) // whole-expression native-type preservation:
+                                               // "{{ port }}" renders to an int, not "8080"
+```
+
+`IsTemplate` reports whether a string contains `{{ }}`/`{% %}` at all, so a
+caller can skip the engine for plain values. Ansible's filter and test library
+(`to_json`, `regex_replace`, `combine`, `default`, `mandatory`, `ternary`, …)
+is registered on every `Engine`.
