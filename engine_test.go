@@ -221,6 +221,103 @@ func TestResultTests(t *testing.T) {
 	}
 }
 
+func TestWholeExpressionEdgeCases(t *testing.T) {
+	cases := []struct {
+		name   string
+		s      string
+		wantOK bool
+	}{
+		{"multiple blocks not whole", "{{ a }}{{ b }}", false},
+		{"trailing text not whole", "{{ a }} extra", false},
+		{"empty string", "", false},
+		{"unterminated", "{{ a", false},
+		{"single expression with surrounding space", "  {{ a }}  ", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, ok := wholeExpression(c.s)
+			if ok != c.wantOK {
+				t.Errorf("wholeExpression(%q) ok = %v, want %v", c.s, ok, c.wantOK)
+			}
+		})
+	}
+}
+
+func TestRenderParseError(t *testing.T) {
+	e := New()
+	if _, err := e.Render("{{ 1 + }}", nil); err == nil {
+		t.Fatal("Render with a syntax error: got nil error, want one")
+	}
+}
+
+func TestRenderExecuteError(t *testing.T) {
+	e := New()
+	if _, err := e.Render("{{ 1 | nosuchfilter }}", nil); err == nil {
+		t.Fatal("Render with an undefined filter: got nil error, want one")
+	}
+}
+
+func TestEvalParseError(t *testing.T) {
+	e := New()
+	if _, err := e.Eval("1 +", nil); err == nil {
+		t.Fatal("Eval with a syntax error: got nil error, want one")
+	}
+}
+
+func TestEvalRuntimeError(t *testing.T) {
+	e := New()
+	if _, err := e.Eval("1 | nosuchfilter", nil); err == nil {
+		t.Fatal("Eval with an undefined filter: got nil error, want one")
+	}
+}
+
+func TestEvalBoolParseError(t *testing.T) {
+	e := New()
+	if _, err := e.EvalBool("1 +", nil); err == nil {
+		t.Fatal("EvalBool with a syntax error: got nil error, want one")
+	}
+}
+
+func TestRenderValueScalarPassthrough(t *testing.T) {
+	e := New()
+	for _, v := range []any{42, true, nil, 3.14} {
+		got, err := e.RenderValue(v, nil)
+		if err != nil {
+			t.Fatalf("RenderValue(%#v): %v", v, err)
+		}
+		if got != v {
+			t.Errorf("RenderValue(%#v) = %#v, want unchanged", v, got)
+		}
+	}
+}
+
+func TestRenderValueNonTemplateStringPassthrough(t *testing.T) {
+	e := New()
+	got, err := e.RenderValue("plain string, no delimiters", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "plain string, no delimiters" {
+		t.Errorf("RenderValue on a non-template string = %#v, want it unchanged", got)
+	}
+}
+
+func TestRenderValueErrorPropagatesFromMap(t *testing.T) {
+	e := New()
+	_, err := e.RenderValue(map[string]any{"bad": "{{ 1 | nosuchfilter }}"}, nil)
+	if err == nil {
+		t.Fatal("RenderValue on a map with a bad nested template: got nil error, want one")
+	}
+}
+
+func TestRenderValueErrorPropagatesFromList(t *testing.T) {
+	e := New()
+	_, err := e.RenderValue([]any{"{{ 1 | nosuchfilter }}"}, nil)
+	if err == nil {
+		t.Fatal("RenderValue on a list with a bad nested template: got nil error, want one")
+	}
+}
+
 func TestIsTemplate(t *testing.T) {
 	if !IsTemplate("{{ x }}") {
 		t.Error("{{ x }} should be a template")
