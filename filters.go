@@ -8,7 +8,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"path"
+	"reflect"
+	"strconv"
 	"strings"
 
 	"regexp"
@@ -55,6 +58,25 @@ func registerFilters(filters *exec.FilterSet) {
 	must("md5", filterHash(func(b []byte) string { s := md5.Sum(b); return hex.EncodeToString(s[:]) }))
 	must("sha1", filterHash(func(b []byte) string { s := sha1.Sum(b); return hex.EncodeToString(s[:]) }))
 	must("hash", filterHash(func(b []byte) string { s := sha256.Sum256(b); return hex.EncodeToString(s[:]) }))
+
+	// "unique" is deliberately not registered here: gonja's own builtin
+	// already implements Jinja2's do_unique (case_sensitive/attribute
+	// keyword args included), which is exactly what real Ansible's own
+	// "unique" filter delegates to whenever Jinja2 provides it.
+	must("union", filterUnion)
+	must("intersect", filterIntersect)
+	must("difference", filterDifference)
+	must("symmetric_difference", filterSymmetricDifference)
+
+	must("log", filterLog)
+	must("pow", filterPow)
+	must("root", filterRoot)
+
+	must("human_readable", filterHumanReadable)
+	must("human_to_bytes", filterHumanToBytes)
+	must("rekey_on_member", filterRekeyOnMember)
+
+	must("to_uuid", filterToUUID)
 }
 
 func filterToJSON(indent bool) exec.FilterFunction {
@@ -338,4 +360,388 @@ func filterHash(sum func([]byte) string) exec.FilterFunction {
 	return func(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
 		return exec.AsValue(sum([]byte(in.String())))
 	}
+}
+
+// toList reads v as a []any, or nil if it isn't one — matching this file's
+// existing silent-coerce convention for wrong-typed filter input (see
+// filterDict2Items/filterItems2Dict).
+func toList(v *exec.Value) []any {
+	l, _ := v.ToGoSimpleType(false).([]any)
+	return l
+}
+
+func listContains(list []any, v any) bool {
+	for _, existing := range list {
+		if reflect.DeepEqual(existing, v) {
+			return true
+		}
+	}
+	return false
+}
+
+// dedupPreserveOrder deduplicates by first occurrence. Real Ansible's set
+// filters build a Python set() when every element is hashable, whose
+// iteration order is an implementation detail of CPython's hash table, and
+// only fall back to this same order-preserving dedup when an element isn't
+// hashable (e.g. a list of dicts). This port always takes that
+// order-preserving path, a disclosed simplification rather than a literal
+// reproduction of CPython's unspecified hash order.
+func dedupPreserveOrder(vals []any) []any {
+	out := make([]any, 0, len(vals))
+	for _, v := range vals {
+		if !listContains(out, v) {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func filterUnion(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	p := params.Expect(1, nil)
+	if p.IsError() {
+		return exec.ValueError(fmt.Errorf("%s", p.Error()))
+	}
+	a, b := toList(in), toList(p.Args[0])
+	return exec.AsValue(dedupPreserveOrder(append(append([]any{}, a...), b...)))
+}
+
+func filterIntersect(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	p := params.Expect(1, nil)
+	if p.IsError() {
+		return exec.ValueError(fmt.Errorf("%s", p.Error()))
+	}
+	a, b := toList(in), toList(p.Args[0])
+	out := make([]any, 0, len(a))
+	for _, v := range a {
+		if listContains(b, v) {
+			out = append(out, v)
+		}
+	}
+	return exec.AsValue(dedupPreserveOrder(out))
+}
+
+func filterDifference(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	p := params.Expect(1, nil)
+	if p.IsError() {
+		return exec.ValueError(fmt.Errorf("%s", p.Error()))
+	}
+	a, b := toList(in), toList(p.Args[0])
+	out := make([]any, 0, len(a))
+	for _, v := range a {
+		if !listContains(b, v) {
+			out = append(out, v)
+		}
+	}
+	return exec.AsValue(dedupPreserveOrder(out))
+}
+
+func filterSymmetricDifference(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	p := params.Expect(1, nil)
+	if p.IsError() {
+		return exec.ValueError(fmt.Errorf("%s", p.Error()))
+	}
+	a, b := toList(in), toList(p.Args[0])
+	union := dedupPreserveOrder(append(append([]any{}, a...), b...))
+	isect := make([]any, 0)
+	for _, v := range a {
+		if listContains(b, v) {
+			isect = append(isect, v)
+		}
+	}
+	out := make([]any, 0, len(union))
+	for _, v := range union {
+		if !listContains(isect, v) {
+			out = append(out, v)
+		}
+	}
+	return exec.AsValue(out)
+}
+
+// floatArg reads an optional numeric argument by position, falling back to
+// the same name given as a keyword argument, then to fallback — matching
+// real Ansible's Python calling convention where log/root's "base" is a
+// normal positional-or-keyword parameter.
+func floatArg(params *exec.VarArgs, index int, name string, fallback float64) float64 {
+	if len(params.Args) > index {
+		return params.Args[index].Float()
+	}
+	if kw, ok := params.KwArgs[name]; ok {
+		return kw.Float()
+	}
+	return fallback
+}
+
+func filterLog(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	base := floatArg(params, 0, "base", math.E)
+	x := in.Float()
+	if base == 10 {
+		return exec.AsValue(math.Log10(x))
+	}
+	return exec.AsValue(math.Log(x) / math.Log(base))
+}
+
+func filterPow(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	p := params.Expect(1, nil)
+	if p.IsError() {
+		return exec.ValueError(fmt.Errorf("%s", p.Error()))
+	}
+	return exec.AsValue(math.Pow(in.Float(), p.Args[0].Float()))
+}
+
+func filterRoot(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	base := floatArg(params, 0, "base", 2)
+	x := in.Float()
+	if base == 2 {
+		return exec.AsValue(math.Sqrt(x))
+	}
+	return exec.AsValue(math.Pow(x, 1.0/base))
+}
+
+// sizeRanges mirrors real Ansible's own SIZE_RANGES table
+// (ansible.module_utils.common.text.formatters), largest unit first —
+// already the order bytes_to_human needs and dict-insertion order gives its
+// Python original.
+var sizeRanges = []struct {
+	suffix string
+	limit  float64
+}{
+	{"Y", math.Pow(2, 80)},
+	{"Z", math.Pow(2, 70)},
+	{"E", math.Pow(2, 60)},
+	{"P", math.Pow(2, 50)},
+	{"T", math.Pow(2, 40)},
+	{"G", math.Pow(2, 30)},
+	{"M", math.Pow(2, 20)},
+	{"K", math.Pow(2, 10)},
+	{"B", 1},
+}
+
+// validUnits mirrors real Ansible's VALID_UNITS table: for each range key,
+// the [byte-name, bit-name] pair accepted as a spelled-out unit.
+var validUnits = map[string][2][2]string{
+	"B": {{"byte", "B"}, {"bit", "b"}},
+	"K": {{"kilobyte", "KB"}, {"kilobit", "Kb"}},
+	"M": {{"megabyte", "MB"}, {"megabit", "Mb"}},
+	"G": {{"gigabyte", "GB"}, {"gigabit", "Gb"}},
+	"T": {{"terabyte", "TB"}, {"terabit", "Tb"}},
+	"P": {{"petabyte", "PB"}, {"petabit", "Pb"}},
+	"E": {{"exabyte", "EB"}, {"exabit", "Eb"}},
+	"Z": {{"zetabyte", "ZB"}, {"zetabit", "Zb"}},
+	"Y": {{"yottabyte", "YB"}, {"yottabit", "Yb"}},
+}
+
+var humanToBytesRe = regexp.MustCompile(`^([0-9]*\.?[0-9]+)(?:\s*([A-Za-z]+))?\s*$`)
+
+// humanToBytesValue ports formatters.py's human_to_bytes() exactly,
+// including its two-tier unit check: a single-letter suffix ("M") always
+// matches, a spelled-out one must match VALID_UNITS' byte/bit form for that
+// range and for isbits.
+func humanToBytesValue(number, defaultUnit string, isbits bool) (int64, error) {
+	m := humanToBytesRe.FindStringSubmatch(strings.TrimSpace(number))
+	if m == nil {
+		return 0, fmt.Errorf("can't interpret following string: %s", number)
+	}
+	num, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		return 0, fmt.Errorf("can't interpret following number: %s (original input string: %s)", m[1], number)
+	}
+	unit := m[2]
+	if unit == "" {
+		unit = defaultUnit
+	}
+	if unit == "" {
+		return int64(math.Round(num)), nil
+	}
+	rangeKey := strings.ToUpper(unit[:1])
+	var limit float64
+	found := false
+	for _, r := range sizeRanges {
+		if r.suffix == rangeKey {
+			limit, found = r.limit, true
+			break
+		}
+	}
+	if !found {
+		keys := make([]string, len(sizeRanges))
+		for i, r := range sizeRanges {
+			keys[i] = r.suffix
+		}
+		return 0, fmt.Errorf("failed to convert %s (unit = %s). The suffix must be one of %s", number, unit, strings.Join(keys, ", "))
+	}
+
+	unitClass, unitClassName := "B", "byte"
+	if isbits {
+		unitClass, unitClassName = "b", "bit"
+	}
+	if len(unit) > 1 {
+		expect := fmt.Sprintf("expect %s%s or %s", rangeKey, unitClass, rangeKey)
+		if rangeKey == "B" {
+			expect = fmt.Sprintf("expect %s or %s", unitClass, unitClassName)
+		}
+		pair := validUnits[rangeKey]
+		idx := 0
+		if isbits {
+			idx = 1
+		}
+		switch {
+		case strings.ToLower(unit) == pair[idx][0]:
+		case unit != pair[idx][1]:
+			return 0, fmt.Errorf("failed to convert %s. Value is not a valid string (%s)", number, expect)
+		}
+	}
+	return int64(math.Round(num * limit)), nil
+}
+
+// bytesToHumanValue ports formatters.py's bytes_to_human() exactly: unit,
+// when given, must be the single-letter range key (real Ansible compares
+// the whole uppercased unit string against that one letter, so a spelled-
+// out unit like "MB" never matches and falls through to the smallest
+// range, exactly as it does in the Python original).
+func bytesToHumanValue(size float64, isbits bool, unit string) string {
+	base := "Bytes"
+	if isbits {
+		base = "bits"
+	}
+	suffix, limit := sizeRanges[len(sizeRanges)-1].suffix, sizeRanges[len(sizeRanges)-1].limit
+	for _, r := range sizeRanges {
+		suffix, limit = r.suffix, r.limit
+		if (unit == "" && size >= limit) || (unit != "" && strings.ToUpper(unit) == r.suffix) {
+			break
+		}
+	}
+	if limit != 1 {
+		suffix += base[:1]
+	} else {
+		suffix = base
+	}
+	return fmt.Sprintf("%.2f %s", size/limit, suffix)
+}
+
+func filterHumanReadable(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	isbits := params.GetKeywordArgument("isbits", exec.AsValue(false)).IsTrue()
+	unit := params.GetKeywordArgument("unit", exec.AsValue("")).String()
+	if len(params.Args) > 0 {
+		isbits = params.Args[0].IsTrue()
+	}
+	if len(params.Args) > 1 {
+		unit = params.Args[1].String()
+	}
+	return exec.AsValue(bytesToHumanValue(in.Float(), isbits, unit))
+}
+
+func filterHumanToBytes(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	defaultUnit := params.GetKeywordArgument("default_unit", exec.AsValue("")).String()
+	isbits := params.GetKeywordArgument("isbits", exec.AsValue(false)).IsTrue()
+	if len(params.Args) > 0 {
+		defaultUnit = params.Args[0].String()
+	}
+	if len(params.Args) > 1 {
+		isbits = params.Args[1].IsTrue()
+	}
+	out, err := humanToBytesValue(in.String(), defaultUnit, isbits)
+	if err != nil {
+		return exec.ValueError(fmt.Errorf("human_to_bytes: %w", err))
+	}
+	return exec.AsValue(out)
+}
+
+func filterRekeyOnMember(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	p := params.Expect(1, []*exec.KwArg{{Name: "duplicates", Default: "error"}})
+	if p.IsError() {
+		return exec.ValueError(fmt.Errorf("%s", p.Error()))
+	}
+	key := p.Args[0].String()
+	duplicates := p.KwArgs["duplicates"].String()
+	if duplicates != "error" && duplicates != "overwrite" {
+		return exec.ValueError(fmt.Errorf("rekey_on_member: duplicates parameter has unknown value %q", duplicates))
+	}
+
+	var items []any
+	switch t := in.ToGoSimpleType(false).(type) {
+	case map[string]any:
+		items = make([]any, 0, len(t))
+		for _, v := range t {
+			items = append(items, v)
+		}
+	case []any:
+		items = t
+	default:
+		return exec.ValueError(fmt.Errorf("rekey_on_member: type is not a valid list, set, or dict"))
+	}
+
+	out := map[string]any{}
+	for _, item := range items {
+		m, ok := item.(map[string]any)
+		if !ok {
+			return exec.ValueError(fmt.Errorf("rekey_on_member: list item is not a valid dict"))
+		}
+		keyElem, ok := m[key]
+		if !ok {
+			return exec.ValueError(fmt.Errorf("rekey_on_member: key %q was not found", key))
+		}
+		keyStr := fmt.Sprintf("%v", keyElem)
+		if _, exists := out[keyStr]; exists && duplicates == "error" {
+			return exec.ValueError(fmt.Errorf("rekey_on_member: key %q is not unique, cannot convert to dict", keyStr))
+		}
+		out[keyStr] = m
+	}
+	return exec.AsValue(out)
+}
+
+// ansibleUUIDNamespace is Ansible's own fixed default namespace for
+// to_uuid, UUID_NAMESPACE_ANSIBLE in ansible-core's core.py filters.
+var ansibleUUIDNamespace = mustParseUUID("361E6D51-FAEC-444A-9079-341386DA8E2E")
+
+func mustParseUUID(s string) [16]byte {
+	u, err := parseUUID(s)
+	if err != nil {
+		panic(err)
+	}
+	return u
+}
+
+func parseUUID(s string) ([16]byte, error) {
+	var u [16]byte
+	hexDigits := strings.ReplaceAll(s, "-", "")
+	if len(hexDigits) != 32 {
+		return u, fmt.Errorf("invalid UUID %q", s)
+	}
+	b, err := hex.DecodeString(hexDigits)
+	if err != nil {
+		return u, fmt.Errorf("invalid UUID %q: %w", s, err)
+	}
+	copy(u[:], b)
+	return u, nil
+}
+
+// uuidV5 is RFC 4122 UUID version 5 (SHA-1 name-based), matching Python's
+// uuid.uuid5(namespace, name) exactly.
+func uuidV5(namespace [16]byte, name string) string {
+	h := sha1.New()
+	h.Write(namespace[:])
+	h.Write([]byte(name))
+	sum := h.Sum(nil)
+	var u [16]byte
+	copy(u[:], sum[:16])
+	u[6] = (u[6] & 0x0F) | 0x50
+	u[8] = (u[8] & 0x3F) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
+}
+
+func filterToUUID(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	namespace := ansibleUUIDNamespace
+	namespaceStr := ""
+	if len(params.Args) > 0 {
+		namespaceStr = params.Args[0].String()
+	} else if kw, ok := params.KwArgs["namespace"]; ok {
+		namespaceStr = kw.String()
+	}
+	if namespaceStr != "" {
+		ns, err := parseUUID(namespaceStr)
+		if err != nil {
+			return exec.ValueError(fmt.Errorf("to_uuid: %w", err))
+		}
+		namespace = ns
+	}
+	return exec.AsValue(uuidV5(namespace, in.String()))
 }

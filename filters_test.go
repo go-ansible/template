@@ -1,6 +1,9 @@
 package template
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 func TestJSONFilters(t *testing.T) {
 	e := New()
@@ -388,5 +391,279 @@ func TestB64DecodeError(t *testing.T) {
 	e := New()
 	if _, err := e.Eval(`'not-valid-base64!!' | b64decode`, nil); err == nil {
 		t.Fatal("b64decode on invalid input: got nil error, want one")
+	}
+}
+
+func asAnySlice(vals ...any) []any { return vals }
+
+func TestSetFilters(t *testing.T) {
+	e := New()
+	vars := map[string]any{"a": asAnySlice(1, 2, 3), "b": asAnySlice(2, 3, 4)}
+
+	cases := []struct {
+		expr string
+		want []any
+	}{
+		{`a | union(b)`, asAnySlice(1, 2, 3, 4)},
+		{`a | intersect(b)`, asAnySlice(2, 3)},
+		{`a | difference(b)`, asAnySlice(1)},
+		{`a | symmetric_difference(b)`, asAnySlice(1, 4)},
+	}
+	for _, c := range cases {
+		t.Run(c.expr, func(t *testing.T) {
+			got, err := e.Eval(c.expr, vars)
+			if err != nil {
+				t.Fatal(err)
+			}
+			list, ok := got.([]any)
+			if !ok {
+				t.Fatalf("%s = %#v (%T), want []any", c.expr, got, got)
+			}
+			if len(list) != len(c.want) {
+				t.Fatalf("%s = %#v, want %#v", c.expr, list, c.want)
+			}
+			for i := range list {
+				gotInt, _ := list[i].(int)
+				wantInt, _ := c.want[i].(int)
+				if gotInt != wantInt {
+					t.Fatalf("%s = %#v, want %#v", c.expr, list, c.want)
+				}
+			}
+		})
+	}
+}
+
+func TestSetFiltersMissingArg(t *testing.T) {
+	e := New()
+	for _, expr := range []string{
+		`a | union`, `a | intersect`, `a | difference`, `a | symmetric_difference`,
+	} {
+		if _, err := e.Eval(expr, map[string]any{"a": asAnySlice(1, 2)}); err == nil {
+			t.Errorf("%s with no argument: got nil error, want one", expr)
+		}
+	}
+}
+
+func TestSetFiltersDedupWithinInput(t *testing.T) {
+	e := New()
+	got, err := e.Eval(`a | union(b)`, map[string]any{
+		"a": asAnySlice(1, 1, 2),
+		"b": asAnySlice(2, 3),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	list := got.([]any)
+	if len(list) != 3 {
+		t.Fatalf("union with duplicate input = %#v, want 3 deduped elements", list)
+	}
+}
+
+func TestLogPowRootFilters(t *testing.T) {
+	e := New()
+	cases := []struct {
+		expr string
+		want float64
+	}{
+		{`100 | log(10)`, 2},
+		{`8 | log(2)`, 3},
+		{`2 | pow(10)`, 1024},
+		{`16 | root`, 4},
+		// math.Pow(27, 1.0/3.0) lands a hair under 3 due to IEEE 754
+		// rounding, same as real Python's 27 ** (1/3) — not a bug.
+		{`27 | root(3)`, 3},
+	}
+	for _, c := range cases {
+		t.Run(c.expr, func(t *testing.T) {
+			got, err := e.Eval(c.expr, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f, ok := got.(float64)
+			if !ok {
+				t.Fatalf("%s = %#v (%T), want float64", c.expr, got, got)
+			}
+			if math.Abs(f-c.want) > 1e-9 {
+				t.Errorf("%s = %v, want %v", c.expr, f, c.want)
+			}
+		})
+	}
+
+	if _, err := e.Eval(`2 | pow`, nil); err == nil {
+		t.Fatal("pow with no argument: got nil error, want one")
+	}
+
+	got, err := e.Eval(`100 | log(base=10)`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f, _ := got.(float64); math.Abs(f-2) > 1e-9 {
+		t.Errorf("log(base=10) = %v, want 2", got)
+	}
+}
+
+func TestHumanReadableFilter(t *testing.T) {
+	e := New()
+	cases := []struct {
+		expr string
+		want string
+	}{
+		{`1024 | human_readable`, "1.00 KB"},
+		{`1073741824 | human_readable`, "1.00 GB"},
+		{`1024 | human_readable(unit='M')`, "0.00 MB"},
+		{`1024 | human_readable(True)`, "1.00 Kb"},
+		{`1024 | human_readable(False, 'M')`, "0.00 MB"},
+	}
+	for _, c := range cases {
+		t.Run(c.expr, func(t *testing.T) {
+			got, err := e.Render(`{{ `+c.expr+` }}`, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != c.want {
+				t.Errorf("%s = %q, want %q", c.expr, got, c.want)
+			}
+		})
+	}
+}
+
+func TestHumanToBytesFilter(t *testing.T) {
+	e := New()
+	cases := []struct {
+		expr string
+		want int64
+	}{
+		{`'1024' | human_to_bytes`, 1024},
+		{`'1M' | human_to_bytes`, 1048576},
+		{`'1MB' | human_to_bytes`, 1048576},
+		{`'10' | human_to_bytes(default_unit='M')`, 10485760},
+	}
+	for _, c := range cases {
+		t.Run(c.expr, func(t *testing.T) {
+			got, err := e.Eval(c.expr, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			n, ok := got.(int)
+			if !ok {
+				t.Fatalf("%s = %#v (%T), want int", c.expr, got, got)
+			}
+			if int64(n) != c.want {
+				t.Errorf("%s = %v, want %v", c.expr, n, c.want)
+			}
+		})
+	}
+
+	if _, err := e.Eval(`'10Q' | human_to_bytes`, nil); err == nil {
+		t.Fatal("human_to_bytes with an unknown unit suffix: got nil error, want one")
+	}
+	if _, err := e.Eval(`'not a number' | human_to_bytes`, nil); err == nil {
+		t.Fatal("human_to_bytes on unparseable input: got nil error, want one")
+	}
+	if _, err := e.Eval(`'10Kb' | human_to_bytes`, nil); err == nil {
+		t.Fatal("human_to_bytes with a bit unit but isbits=False: got nil error, want one")
+	}
+
+	got, err := e.Eval(`'10' | human_to_bytes('K', True)`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := got.(int); n != 10240 {
+		t.Errorf("human_to_bytes('K', True) = %v, want 10240", got)
+	}
+}
+
+func TestRekeyOnMemberFilter(t *testing.T) {
+	e := New()
+	list := []any{
+		map[string]any{"name": "a", "id": 1},
+		map[string]any{"name": "b", "id": 2},
+	}
+
+	got, err := e.RenderValue(`{{ l | rekey_on_member('name') }}`, map[string]any{"l": list})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := got.(map[string]any)
+	if len(m) != 2 {
+		t.Fatalf("rekey_on_member = %#v, want 2 entries", m)
+	}
+	if a := m["a"].(map[string]any); a["id"] != 1 {
+		t.Fatalf(`rekey_on_member["a"] = %#v, want id=1`, a)
+	}
+
+	dup := []any{
+		map[string]any{"name": "a", "id": 1},
+		map[string]any{"name": "a", "id": 2},
+	}
+	if _, err := e.Eval(`l | rekey_on_member('name')`, map[string]any{"l": dup}); err == nil {
+		t.Fatal("rekey_on_member with a duplicate key and duplicates=error: got nil error, want one")
+	}
+
+	got, err = e.RenderValue(`{{ l | rekey_on_member('name', duplicates='overwrite') }}`, map[string]any{"l": dup})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m = got.(map[string]any)
+	if a := m["a"].(map[string]any); a["id"] != 2 {
+		t.Fatalf(`rekey_on_member overwrite ["a"] = %#v, want id=2 (last write wins)`, a)
+	}
+
+	if _, err := e.Eval(`l | rekey_on_member('missing')`, map[string]any{"l": list}); err == nil {
+		t.Fatal("rekey_on_member with a key absent from every item: got nil error, want one")
+	}
+	if _, err := e.Eval(`l | rekey_on_member('name', duplicates='bogus')`, map[string]any{"l": list}); err == nil {
+		t.Fatal("rekey_on_member with an unknown duplicates value: got nil error, want one")
+	}
+	if _, err := e.Eval(`l | rekey_on_member('name')`, map[string]any{"l": asAnySlice(1, 2)}); err == nil {
+		t.Fatal("rekey_on_member on a list of non-dicts: got nil error, want one")
+	}
+
+	// A dict-of-dicts input rekeys the same way, over its values.
+	got, err = e.RenderValue(`{{ d | rekey_on_member('name') }}`, map[string]any{
+		"d": map[string]any{"first": map[string]any{"name": "a", "id": 1}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m = got.(map[string]any)
+	if a := m["a"].(map[string]any); a["id"] != 1 {
+		t.Fatalf("rekey_on_member on dict-of-dicts = %#v", m)
+	}
+}
+
+func TestToUUIDFilter(t *testing.T) {
+	e := New()
+	// Reference values computed with real Python's uuid.uuid5 against
+	// Ansible's own default namespace UUID_NAMESPACE_ANSIBLE.
+	got, err := e.Render(`{{ 'test' | to_uuid }}`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "f4fb6740-9e00-5ac4-9581-f24b6ecfe71e" {
+		t.Errorf("to_uuid('test') = %q, want %q", got, "f4fb6740-9e00-5ac4-9581-f24b6ecfe71e")
+	}
+
+	got, err = e.Render(`{{ 'ansible' | to_uuid }}`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "5ecca099-0345-5f70-b25a-bacaea0dd909" {
+		t.Errorf("to_uuid('ansible') = %q, want %q", got, "5ecca099-0345-5f70-b25a-bacaea0dd909")
+	}
+
+	got, err = e.Render(`{{ 'test' | to_uuid('6ba7b810-9dad-11d1-80b4-00c04fd430c8') }}`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "4be0643f-1d98-573b-97cd-ca98a65347dd" {
+		t.Errorf("to_uuid('test', custom namespace) = %q, want %q", got, "4be0643f-1d98-573b-97cd-ca98a65347dd")
+	}
+
+	if _, err := e.Eval(`'test' | to_uuid('not-a-uuid')`, nil); err == nil {
+		t.Fatal("to_uuid with a malformed namespace: got nil error, want one")
+	}
+	if _, err := e.Eval(`'test' | to_uuid('gggggggg-gggg-gggg-gggg-gggggggggggg')`, nil); err == nil {
+		t.Fatal("to_uuid with a right-length but non-hex namespace: got nil error, want one")
 	}
 }
