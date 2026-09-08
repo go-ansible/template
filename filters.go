@@ -116,6 +116,8 @@ func registerFilters(filters *exec.FilterSet) {
 	must("flatten", filterFlatten)
 	must("subelements", filterSubelements)
 	must("split", filterSplit)
+
+	must("fileglob", filterFileglob)
 }
 
 func filterToJSON(indent bool) exec.FilterFunction {
@@ -1733,6 +1735,30 @@ func filterSplit(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.
 	out := make([]any, len(parts))
 	for i, p := range parts {
 		out[i] = p
+	}
+	return exec.AsValue(out)
+}
+
+// filterFileglob ports core.py's fileglob(): real Ansible is literally
+// [g for g in glob.glob(pathname) if os.path.isfile(g)] — filepath.Glob
+// matches Python's non-recursive glob.glob syntax closely enough (*, ?,
+// [...], no ** recursion in either since Python's glob.glob doesn't
+// recurse without an explicit recursive=True this filter never passes).
+// One disclosed, low-stakes difference: filepath.Glob sorts its matches,
+// while Python's glob.glob returns raw, filesystem-order (unsorted)
+// results — a real playbook depending on that unsorted order would
+// already be fragile across systems, so this port's sorted order is a
+// reasonable divergence, not a bug.
+func filterFileglob(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	matches, err := filepath.Glob(in.String())
+	if err != nil {
+		return exec.ValueError(fmt.Errorf("fileglob: %w", err))
+	}
+	out := make([]any, 0, len(matches))
+	for _, m := range matches {
+		if fi, err := os.Stat(m); err == nil && fi.Mode().IsRegular() {
+			out = append(out, m)
+		}
 	}
 	return exec.AsValue(out)
 }
