@@ -111,6 +111,11 @@ func registerFilters(filters *exec.FilterSet) {
 	must("combinations", filterCombinations)
 	must("zip", filterZip)
 	must("zip_longest", filterZipLongest)
+
+	must("extract", filterExtract)
+	must("flatten", filterFlatten)
+	must("subelements", filterSubelements)
+	must("split", filterSplit)
 }
 
 func filterToJSON(indent bool) exec.FilterFunction {
@@ -1506,6 +1511,228 @@ func filterZipLongest(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *
 			}
 		}
 		out[i] = tuple
+	}
+	return exec.AsValue(out)
+}
+
+// filterExtract ports core.py's extract(): {{ key | extract(container) }}
+// looks up container[key], and {{ key | extract(container, morekeys) }}
+// chains further lookups (morekeys a single key, or a list of them) —
+// container[key][morekeys[0]][morekeys[1]].... Real Ansible's own
+// implementation falls back to environment.getitem's lazy-marker source on
+// a failed lookup; this port has no such marker system, so a failed
+// lookup at any step returns nil, matching this file's own established
+// silent-coerce-on-miss convention (see filterDict2Items/filterItems2Dict).
+func filterExtract(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	p := params.Expect(1, []*exec.KwArg{{Name: "morekeys", Default: nil}})
+	if p.IsError() {
+		return exec.ValueError(fmt.Errorf("%s", p.Error()))
+	}
+	keys := []*exec.Value{in}
+	if mk := p.KwArgs["morekeys"]; !mk.IsNil() {
+		if mk.IsList() {
+			// Iterate's (key, value) pair carries a list's own element in
+			// key, not value — value is nil for a plain list (confirmed
+			// against gonja's own filterSelectAttr, which reads the same
+			// way).
+			mk.Iterate(func(_, _ int, key, _ *exec.Value) bool {
+				keys = append(keys, key)
+				return true
+			}, func() {})
+		} else {
+			keys = append(keys, mk)
+		}
+	}
+
+	value := p.Args[0]
+	for _, key := range keys {
+		var k any
+		switch {
+		case key.IsString():
+			k = key.String()
+		case key.IsInteger():
+			k = key.Integer()
+		default:
+			k = key.Interface()
+		}
+		item, found := value.GetItem(k)
+		if !found && key.IsString() {
+			item, found = value.GetAttribute(key.String())
+		}
+		if !found {
+			return exec.AsValue(nil)
+		}
+		value = item
+	}
+	return value
+}
+
+// flattenList ports core.py's flatten(): real Ansible treats Python None
+// AND the literal strings "None"/"null" as null-like when skip_nulls is
+// set — a real, slightly unusual detail, reproduced rather than narrowed
+// to just nil.
+func flattenList(list []any, levels *int, skipNulls bool) []any {
+	ret := make([]any, 0, len(list))
+	for _, element := range list {
+		if skipNulls && (element == nil || element == "None" || element == "null") {
+			continue
+		}
+		sub, isList := element.([]any)
+		switch {
+		case !isList:
+			ret = append(ret, element)
+		case levels == nil:
+			ret = append(ret, flattenList(sub, nil, skipNulls)...)
+		case *levels >= 1:
+			next := *levels - 1
+			ret = append(ret, flattenList(sub, &next, skipNulls)...)
+		default:
+			ret = append(ret, element)
+		}
+	}
+	return ret
+}
+
+func filterFlatten(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	var levels *int
+	if len(params.Args) > 0 {
+		l := params.Args[0].Integer()
+		levels = &l
+	} else if kw, ok := params.KwArgs["levels"]; ok && !kw.IsNil() {
+		l := kw.Integer()
+		levels = &l
+	}
+	skipNulls := true
+	if kw, ok := params.KwArgs["skip_nulls"]; ok {
+		skipNulls = kw.IsTrue()
+	}
+	return exec.AsValue(flattenList(toList(in), levels, skipNulls))
+}
+
+// filterSubelements ports core.py's subelements(): pairs each element of
+// obj (a dict's values, or a list) with every item found by walking the
+// dotted/list subelement accessor into that element, producing a
+// cartesian-style list of [element, subvalue] pairs — real Ansible
+// returns 2-tuples, represented here as 2-element []any, matching this
+// file's own convention elsewhere (e.g. filterSplitext).
+func filterSubelements(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	p := params.Expect(1, []*exec.KwArg{{Name: "skip_missing", Default: false}})
+	if p.IsError() {
+		return exec.ValueError(fmt.Errorf("%s", p.Error()))
+	}
+	skipMissing := p.KwArgs["skip_missing"].IsTrue()
+
+	var elementList []any
+	switch t := in.ToGoSimpleType(false).(type) {
+	case map[string]any:
+		for _, v := range t {
+			elementList = append(elementList, v)
+		}
+	case []any:
+		elementList = t
+	default:
+		return exec.ValueError(fmt.Errorf("subelements: obj must be a list of dicts or a nested dict"))
+	}
+
+	subArg := p.Args[0]
+	var subelementList []string
+	switch {
+	case subArg.IsList():
+		for _, v := range toList(subArg) {
+			subelementList = append(subelementList, fmt.Sprintf("%v", v))
+		}
+	case subArg.IsString():
+		subelementList = strings.Split(subArg.String(), ".")
+	default:
+		return exec.ValueError(fmt.Errorf("subelements: must be a list or a string, got %T", subArg.Interface()))
+	}
+
+	results := make([]any, 0)
+	for _, element := range elementList {
+		var values any = element
+		for _, sub := range subelementList {
+			m, ok := values.(map[string]any)
+			if !ok {
+				return exec.ValueError(fmt.Errorf("subelements: the key %q should point to a dictionary, got %#v", sub, values))
+			}
+			v, ok := m[sub]
+			if !ok {
+				if skipMissing {
+					values = []any{}
+					break
+				}
+				return exec.ValueError(fmt.Errorf("subelements: could not find %q key in iterated item %#v", sub, values))
+			}
+			values = v
+		}
+		list, ok := values.([]any)
+		if !ok {
+			if len(subelementList) > 0 {
+				return exec.ValueError(fmt.Errorf("subelements: the key should point to a list, got %#v", values))
+			}
+			return exec.ValueError(fmt.Errorf("subelements: subelements in the object must be a list, got %T", values))
+		}
+		for _, v := range list {
+			results = append(results, []any{element, v})
+		}
+	}
+	return exec.AsValue(results)
+}
+
+var splitWhitespaceRe = regexp.MustCompile(`\s+`)
+
+// pySplitWhitespace ports Python's str.split() (no separator argument):
+// splits on runs of whitespace, discarding leading/trailing empties —
+// exactly strings.Fields, except when maxsplit caps the number of splits,
+// where the untouched remainder (with its own original inter-word
+// whitespace) becomes the final element.
+func pySplitWhitespace(s string, maxsplit int) []string {
+	if maxsplit < 0 {
+		return strings.Fields(s)
+	}
+	trimmed := strings.TrimFunc(s, unicode.IsSpace)
+	if trimmed == "" {
+		return []string{}
+	}
+	locs := splitWhitespaceRe.FindAllStringIndex(trimmed, maxsplit)
+	parts := make([]string, 0, len(locs)+1)
+	prev := 0
+	for _, loc := range locs {
+		parts = append(parts, trimmed[prev:loc[0]])
+		prev = loc[1]
+	}
+	parts = append(parts, trimmed[prev:])
+	return parts
+}
+
+func filterSplit(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	s := in.String()
+	sep, hasSep := "", false
+	if len(params.Args) > 0 {
+		sep, hasSep = params.Args[0].String(), true
+	} else if kw, ok := params.KwArgs["sep"]; ok && !kw.IsNil() {
+		sep, hasSep = kw.String(), true
+	}
+	maxsplit := -1
+	if len(params.Args) > 1 {
+		maxsplit = params.Args[1].Integer()
+	} else if kw, ok := params.KwArgs["maxsplit"]; ok && !kw.IsNil() {
+		maxsplit = kw.Integer()
+	}
+
+	var parts []string
+	if !hasSep {
+		parts = pySplitWhitespace(s, maxsplit)
+	} else {
+		n := maxsplit
+		if maxsplit >= 0 {
+			n = maxsplit + 1
+		}
+		parts = strings.SplitN(s, sep, n)
+	}
+	out := make([]any, len(parts))
+	for i, p := range parts {
+		out[i] = p
 	}
 	return exec.AsValue(out)
 }
