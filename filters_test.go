@@ -1087,3 +1087,128 @@ func TestCommentFilter(t *testing.T) {
 		t.Errorf("comment with a blank line = %q, want %q", got, want)
 	}
 }
+
+// tuplesEqual compares a []any of []any "tuples" (as every combinatorial
+// filter below returns) against a matching [][]int reference for both
+// content AND order — order is part of what's being verified, since these
+// filters port Python's own specific generator algorithms, not just their
+// result sets.
+func tuplesEqual(t *testing.T, got any, want [][]int) {
+	t.Helper()
+	list, ok := got.([]any)
+	if !ok {
+		t.Fatalf("result type = %T, want []any", got)
+	}
+	if len(list) != len(want) {
+		t.Fatalf("got %d tuples, want %d: %#v", len(list), len(want), list)
+	}
+	for i, w := range want {
+		tuple, ok := list[i].([]any)
+		if !ok || len(tuple) != len(w) {
+			t.Fatalf("tuple %d = %#v, want %v", i, list[i], w)
+		}
+		for j, wv := range w {
+			gv, _ := tuple[j].(int)
+			if gv != wv {
+				t.Fatalf("tuple %d = %#v, want %v", i, list[i], w)
+			}
+		}
+	}
+}
+
+func TestProductFilter(t *testing.T) {
+	e := New()
+
+	got, err := e.Eval(`a | product(b)`, map[string]any{"a": asAnySlice(1, 2), "b": asAnySlice(3, 4)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tuplesEqual(t, got, [][]int{{1, 3}, {1, 4}, {2, 3}, {2, 4}})
+
+	got, err = e.Eval(`a | product(repeat=2)`, map[string]any{"a": asAnySlice(1, 2)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tuplesEqual(t, got, [][]int{{1, 1}, {1, 2}, {2, 1}, {2, 2}})
+}
+
+func TestPermutationsFilter(t *testing.T) {
+	e := New()
+
+	got, err := e.Eval(`a | permutations(2)`, map[string]any{"a": asAnySlice(1, 2, 3)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tuplesEqual(t, got, [][]int{{1, 2}, {1, 3}, {2, 1}, {2, 3}, {3, 1}, {3, 2}})
+
+	got, err = e.Eval(`a | permutations`, map[string]any{"a": asAnySlice(1, 2)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tuplesEqual(t, got, [][]int{{1, 2}, {2, 1}})
+
+	got, err = e.Eval(`a | permutations(r=2)`, map[string]any{"a": asAnySlice(1, 2, 3)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tuplesEqual(t, got, [][]int{{1, 2}, {1, 3}, {2, 1}, {2, 3}, {3, 1}, {3, 2}})
+
+	got, err = e.Eval(`a | permutations(0)`, map[string]any{"a": asAnySlice(1, 2)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tuplesEqual(t, got, [][]int{{}})
+
+	got, err = e.Eval(`a | permutations(5)`, map[string]any{"a": asAnySlice(1, 2)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	list := got.([]any)
+	if len(list) != 0 {
+		t.Errorf("permutations(r > n) = %#v, want an empty list", list)
+	}
+}
+
+func TestCombinationsFilter(t *testing.T) {
+	e := New()
+
+	got, err := e.Eval(`a | combinations(2)`, map[string]any{"a": asAnySlice(1, 2, 3)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tuplesEqual(t, got, [][]int{{1, 2}, {1, 3}, {2, 3}})
+
+	if _, err := e.Eval(`a | combinations`, map[string]any{"a": asAnySlice(1, 2, 3)}); err == nil {
+		t.Fatal("combinations with no r argument: got nil error, want one (r is required)")
+	}
+}
+
+func TestZipFilter(t *testing.T) {
+	e := New()
+
+	got, err := e.Eval(`a | zip(b)`, map[string]any{"a": asAnySlice(1, 2, 3), "b": asAnySlice(4, 5)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tuplesEqual(t, got, [][]int{{1, 4}, {2, 5}})
+}
+
+func TestZipLongestFilter(t *testing.T) {
+	e := New()
+
+	got, err := e.Eval(`a | zip_longest(b, fillvalue=0)`, map[string]any{"a": asAnySlice(1, 2, 3), "b": asAnySlice(4, 5)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tuplesEqual(t, got, [][]int{{1, 4}, {2, 5}, {3, 0}})
+
+	gotVal, err := e.Eval(`a | zip_longest(b)`, map[string]any{"a": asAnySlice(1, 2, 3), "b": asAnySlice(4, 5)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	list := gotVal.([]any)
+	last := list[2].([]any)
+	if last[0] != 3 || last[1] != nil {
+		t.Errorf("zip_longest without fillvalue, last tuple = %#v, want (3, nil)", last)
+	}
+}
