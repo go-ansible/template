@@ -1212,3 +1212,206 @@ func TestZipLongestFilter(t *testing.T) {
 		t.Errorf("zip_longest without fillvalue, last tuple = %#v, want (3, nil)", last)
 	}
 }
+
+func TestExtractFilter(t *testing.T) {
+	e := New()
+	vars := map[string]any{
+		"container": map[string]any{"a": map[string]any{"b": 3}},
+		"list":      asAnySlice("x", "y", "z"),
+	}
+
+	got, err := e.Eval(`'a' | extract(container)`, vars)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, ok := got.(map[string]any)
+	if !ok || m["b"] != 3 {
+		t.Fatalf(`extract('a', container) = %#v, want {"b": 3}`, got)
+	}
+
+	got, err = e.Eval(`'a' | extract(container, 'b')`, vars)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 3 {
+		t.Errorf(`extract('a', container, 'b') = %#v, want 3`, got)
+	}
+
+	got, err = e.Eval(`1 | extract(list)`, vars)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "y" {
+		t.Errorf(`extract(1, list) = %#v, want "y"`, got)
+	}
+
+	got, err = e.Eval(`'missing' | extract(container)`, vars)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Errorf(`extract('missing', container) = %#v, want nil`, got)
+	}
+
+	got, err = e.Eval(`'a' | extract(container, ['b'])`, vars)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 3 {
+		t.Errorf(`extract('a', container, ['b']) = %#v, want 3 (morekeys as a list)`, got)
+	}
+}
+
+func TestFlattenFilter(t *testing.T) {
+	e := New()
+	got, err := e.RenderValue(`{{ l | flatten }}`, map[string]any{
+		"l": asAnySlice(1, asAnySlice(2, 3, asAnySlice(4, 5)), 6),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	list := got.([]any)
+	if len(list) != 6 {
+		t.Fatalf("flatten (fully) = %#v, want 6 elements", list)
+	}
+
+	got, err = e.RenderValue(`{{ l | flatten(1) }}`, map[string]any{
+		"l": asAnySlice(1, asAnySlice(2, asAnySlice(3, 4)), 5),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if list := got.([]any); len(list) != 4 {
+		t.Fatalf("flatten(1) (positional) = %#v, want 4 elements", list)
+	}
+
+	got, err = e.RenderValue(`{{ l | flatten(levels=1) }}`, map[string]any{
+		"l": asAnySlice(1, asAnySlice(2, asAnySlice(3, 4)), 5),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	list = got.([]any)
+	if len(list) != 4 {
+		t.Fatalf("flatten(levels=1) = %#v, want 4 elements (one level deep)", list)
+	}
+	if inner, ok := list[2].([]any); !ok || len(inner) != 2 {
+		t.Errorf("flatten(levels=1)[2] = %#v, want the still-nested [3,4]", list[2])
+	}
+
+	got, err = e.RenderValue(`{{ l | flatten(skip_nulls=False) }}`, map[string]any{
+		"l": asAnySlice(1, nil, 2),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	list = got.([]any)
+	if len(list) != 3 {
+		t.Fatalf("flatten(skip_nulls=False) = %#v, want nulls kept (3 elements)", list)
+	}
+
+	got, err = e.RenderValue(`{{ l | flatten }}`, map[string]any{
+		"l": asAnySlice(1, nil, "None", "null", 2),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	list = got.([]any)
+	if len(list) != 2 {
+		t.Errorf(`flatten (default skip_nulls) = %#v, want [1, 2] (nil/"None"/"null" all dropped)`, list)
+	}
+}
+
+func TestSubelementsFilter(t *testing.T) {
+	e := New()
+	obj := asAnySlice(
+		map[string]any{"name": "alice", "groups": asAnySlice("wheel", "docker")},
+		map[string]any{"name": "bob", "groups": asAnySlice("docker")},
+	)
+
+	got, err := e.Eval(`obj | subelements('groups')`, map[string]any{"obj": obj})
+	if err != nil {
+		t.Fatal(err)
+	}
+	list := got.([]any)
+	if len(list) != 3 {
+		t.Fatalf("subelements = %#v, want 3 pairs (2 for alice, 1 for bob)", list)
+	}
+	pair, ok := list[0].([]any)
+	if !ok || len(pair) != 2 {
+		t.Fatalf("subelements[0] = %#v, want a 2-element pair", list[0])
+	}
+	elem := pair[0].(map[string]any)
+	if elem["name"] != "alice" || pair[1] != "wheel" {
+		t.Errorf("subelements[0] = %#v, want (alice, wheel)", pair)
+	}
+
+	if _, err := e.Eval(`obj | subelements('nosuchkey')`, map[string]any{"obj": obj}); err == nil {
+		t.Fatal("subelements with a missing key and skip_missing=false: got nil error, want one")
+	}
+
+	got, err = e.Eval(`obj | subelements('nosuchkey', skip_missing=True)`, map[string]any{"obj": obj})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if list := got.([]any); len(list) != 0 {
+		t.Errorf("subelements with skip_missing=True = %#v, want an empty list", list)
+	}
+
+	// A dict-of-dicts input iterates over its values, same as a list.
+	got, err = e.Eval(`obj | subelements('groups')`, map[string]any{
+		"obj": map[string]any{"first": map[string]any{"name": "alice", "groups": asAnySlice("wheel")}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if list := got.([]any); len(list) != 1 {
+		t.Errorf("subelements on dict-of-dicts = %#v, want 1 pair", list)
+	}
+
+	if _, err := e.Eval(`obj | subelements`, map[string]any{"obj": obj}); err == nil {
+		t.Fatal("subelements with no accessor argument: got nil error, want one")
+	}
+	if _, err := e.Eval(`5 | subelements('x')`, nil); err == nil {
+		t.Fatal("subelements on neither a list nor a dict: got nil error, want one")
+	}
+	if _, err := e.Eval(`obj | subelements('name')`, map[string]any{"obj": obj}); err == nil {
+		t.Fatal("subelements where the accessor points to a non-list value: got nil error, want one")
+	}
+	if _, err := e.Eval(`obj | subelements('name.x')`, map[string]any{"obj": obj}); err == nil {
+		t.Fatal("subelements descending through a non-dict value: got nil error, want one")
+	}
+}
+
+func TestSplitFilter(t *testing.T) {
+	e := New()
+	cases := []struct {
+		expr string
+		want []string
+	}{
+		{`'abc def' | split`, []string{"abc", "def"}},
+		{`'  a  b  c  ' | split`, []string{"a", "b", "c"}},
+		{`'' | split`, []string{}},
+		{`'a,b,,c' | split(',')`, []string{"a", "b", "", "c"}},
+		{`'a,b,c' | split(',', 1)`, []string{"a", "b,c"}},
+		{`'a b c d' | split(maxsplit=2)`, []string{"a", "b", "c d"}},
+		{`'' | split('.')`, []string{""}},
+	}
+	for _, c := range cases {
+		t.Run(c.expr, func(t *testing.T) {
+			got, err := e.Eval(c.expr, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			list, ok := got.([]any)
+			if !ok || len(list) != len(c.want) {
+				t.Fatalf("%s = %#v, want %v", c.expr, got, c.want)
+			}
+			for i, w := range c.want {
+				if list[i] != w {
+					t.Fatalf("%s = %#v, want %v", c.expr, got, c.want)
+				}
+			}
+		})
+	}
+}
