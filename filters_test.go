@@ -2,6 +2,8 @@ package template
 
 import (
 	"math"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -374,7 +376,10 @@ func TestHashFilters(t *testing.T) {
 	}{
 		{"md5", "5d41402abc4b2a76b9719d911017c592"},
 		{"sha1", "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"},
-		{"hash", "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"},
+		{"checksum", "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"},
+		// hash's own default hashtype is sha1 (matching real Ansible's
+		// get_hash(data, hashtype='sha1')), not a fixed sha256.
+		{"hash", "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"},
 	}
 	for _, c := range cases {
 		got, err := e.Render(`{{ 'hello' | `+c.filter+` }}`, nil)
@@ -384,6 +389,18 @@ func TestHashFilters(t *testing.T) {
 		if got != c.want {
 			t.Errorf("%s('hello') = %q, want %q", c.filter, got, c.want)
 		}
+	}
+
+	got, err := e.Render(`{{ 'hello' | hash('sha256') }}`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"; got != want {
+		t.Errorf("hash('hello', 'sha256') = %q, want %q", got, want)
+	}
+
+	if _, err := e.Eval(`'x' | hash('not-a-real-algorithm')`, nil); err == nil {
+		t.Fatal("hash with an unsupported algorithm name: got nil error, want one")
 	}
 }
 
@@ -665,5 +682,408 @@ func TestToUUIDFilter(t *testing.T) {
 	}
 	if _, err := e.Eval(`'test' | to_uuid('gggggggg-gggg-gggg-gggg-gggggggggggg')`, nil); err == nil {
 		t.Fatal("to_uuid with a right-length but non-hex namespace: got nil error, want one")
+	}
+}
+
+func TestBasenameDirnameTrailingSlashAndEmpty(t *testing.T) {
+	e := New()
+	// Reference values are real Python's os.path.basename/dirname, NOT
+	// Go's path.Base/path.Dir — the two disagree here (see filterBasename's
+	// own comment), and this port matches Python since these filters exist
+	// to reproduce Ansible's real behavior.
+	cases := []struct {
+		expr string
+		want string
+	}{
+		{`'/foo/bar/' | basename`, ""},
+		{`'/foo/bar/' | dirname`, "/foo/bar"},
+		{`'foo' | dirname`, ""},
+		{`'' | basename`, ""},
+		{`'' | dirname`, ""},
+	}
+	for _, c := range cases {
+		got, err := e.Render(`{{ `+c.expr+` }}`, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != c.want {
+			t.Errorf("%s = %q, want %q", c.expr, got, c.want)
+		}
+	}
+}
+
+func TestPathJoinFilter(t *testing.T) {
+	e := New()
+	got, err := e.Render(`{{ ['/etc', 'foo', 'bar'] | path_join }}`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "/etc/foo/bar" {
+		t.Errorf("path_join(list) = %q, want %q", got, "/etc/foo/bar")
+	}
+
+	// An absolute component resets everything before it.
+	got, err = e.Render(`{{ ['/etc', '/absolute', 'bar'] | path_join }}`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "/absolute/bar" {
+		t.Errorf("path_join(list with absolute reset) = %q, want %q", got, "/absolute/bar")
+	}
+
+	// A single string is an identity no-op, no join logic runs at all.
+	got, err = e.Render(`{{ 'a/b' | path_join }}`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "a/b" {
+		t.Errorf("path_join(string) = %q, want %q", got, "a/b")
+	}
+
+	if _, err := e.Eval(`5 | path_join`, nil); err == nil {
+		t.Fatal("path_join on neither a string nor a list: got nil error, want one")
+	}
+}
+
+func TestSplitextFilter(t *testing.T) {
+	e := New()
+	cases := []struct {
+		expr      string
+		root, ext string
+	}{
+		{`'archive.tar.gz' | splitext`, "archive.tar", ".gz"},
+		{`'.bashrc' | splitext`, ".bashrc", ""},
+		{`'..bashrc' | splitext`, "..bashrc", ""},
+		{`'a.' | splitext`, "a", "."},
+		{`'/a/.bashrc' | splitext`, "/a/.bashrc", ""},
+	}
+	for _, c := range cases {
+		got, err := e.RenderValue(`{{ `+c.expr+` }}`, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		list, ok := got.([]any)
+		if !ok || len(list) != 2 {
+			t.Fatalf("%s = %#v, want a 2-element list", c.expr, got)
+		}
+		if list[0] != c.root || list[1] != c.ext {
+			t.Errorf("%s = %#v, want (%q, %q)", c.expr, list, c.root, c.ext)
+		}
+	}
+}
+
+func TestNormpathFilter(t *testing.T) {
+	e := New()
+	cases := []struct{ expr, want string }{
+		{`'a/b/../c' | normpath`, "a/c"},
+		{`'./a/b/' | normpath`, "a/b"},
+		{`'//foo' | normpath`, "//foo"},
+		{`'///foo' | normpath`, "/foo"},
+		{`'' | normpath`, "."},
+		{`'/../foo' | normpath`, "/foo"},
+	}
+	for _, c := range cases {
+		got, err := e.Render(`{{ `+c.expr+` }}`, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != c.want {
+			t.Errorf("%s = %q, want %q", c.expr, got, c.want)
+		}
+	}
+}
+
+func TestCommonpathFilter(t *testing.T) {
+	e := New()
+	got, err := e.Render(`{{ ['/usr/lib', '/usr/local/lib'] | commonpath }}`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "/usr" {
+		t.Errorf("commonpath = %q, want %q", got, "/usr")
+	}
+
+	if _, err := e.Eval(`['a/b', '/a/c'] | commonpath`, nil); err == nil {
+		t.Fatal("commonpath mixing absolute and relative paths: got nil error, want one")
+	}
+	if _, err := e.Eval(`[] | commonpath`, nil); err == nil {
+		t.Fatal("commonpath on an empty list: got nil error, want one")
+	}
+
+	// A third, longer path (so the lexicographic min/max scan visits a
+	// path that is neither the running min nor the running max) confirms
+	// the result isn't an artifact of only ever comparing two paths.
+	got, err = e.Render(`{{ ['/usr/lib/x', '/usr/local/lib', '/usr/lib'] | commonpath }}`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "/usr" {
+		t.Errorf("commonpath(3 paths) = %q, want %q", got, "/usr")
+	}
+}
+
+func TestRelpathFilter(t *testing.T) {
+	e := New()
+	got, err := e.Render(`{{ '/a/b/c' | relpath('/a/x') }}`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "../b/c" {
+		t.Errorf("relpath = %q, want %q", got, "../b/c")
+	}
+
+	got, err = e.Render(`{{ '/a/b' | relpath('/a/b') }}`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "." {
+		t.Errorf("relpath of identical paths = %q, want %q", got, ".")
+	}
+}
+
+func TestRealpathFilter(t *testing.T) {
+	e := New()
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := e.Eval(`p | realpath`, map[string]any{"p": link})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != resolved {
+		t.Errorf("realpath(symlink) = %q, want %q", got, resolved)
+	}
+
+	// A nonexistent path falls back to the plain absolute+normalized
+	// path (EvalSymlinks errors on a missing component; see the
+	// filterRealpath's own disclosed-simplification comment).
+	missing := filepath.Join(dir, "does-not-exist")
+	got, err = e.Eval(`p | realpath`, map[string]any{"p": missing})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != missing {
+		t.Errorf("realpath(nonexistent) = %q, want %q", got, missing)
+	}
+}
+
+func TestExpandUserFilter(t *testing.T) {
+	e := New()
+	t.Setenv("HOME", "/home/testuser")
+
+	got, err := e.Render(`{{ '~' | expanduser }}`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "/home/testuser" {
+		t.Errorf("expanduser('~') = %q, want %q", got, "/home/testuser")
+	}
+
+	got, err = e.Render(`{{ '~/x' | expanduser }}`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "/home/testuser/x" {
+		t.Errorf("expanduser('~/x') = %q, want %q", got, "/home/testuser/x")
+	}
+
+	// A path with no leading "~" is returned unchanged.
+	got, err = e.Render(`{{ '/etc/x' | expanduser }}`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "/etc/x" {
+		t.Errorf("expanduser(no tilde) = %q, want %q", got, "/etc/x")
+	}
+
+	// An unresolvable "~user" falls back to the unchanged path, matching
+	// real Python's own "unknown user: return unchanged" behavior.
+	got, err = e.Render(`{{ '~this-user-should-not-exist-anywhere/x' | expanduser }}`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "~this-user-should-not-exist-anywhere/x" {
+		t.Errorf("expanduser(unknown user) = %q, want the path unchanged", got)
+	}
+
+	// With $HOME unset, expandUserHome falls back to the password
+	// database (os/user.Current) rather than failing outright.
+	t.Setenv("HOME", "")
+	if _, err := e.Eval(`'~' | expanduser`, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExpandVarsFilter(t *testing.T) {
+	e := New()
+	t.Setenv("FOO", "bar")
+
+	cases := []struct{ expr, want string }{
+		{`'${FOO}/x' | expandvars`, "bar/x"},
+		{`'$FOO/x' | expandvars`, "bar/x"},
+		{`'$NOTSET_XYZ/x' | expandvars`, "$NOTSET_XYZ/x"},
+		{`'${NOTSET_XYZ/x' | expandvars`, "${NOTSET_XYZ/x"},
+		{`'no vars here' | expandvars`, "no vars here"},
+	}
+	for _, c := range cases {
+		got, err := e.Render(`{{ `+c.expr+` }}`, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != c.want {
+			t.Errorf("%s = %q, want %q", c.expr, got, c.want)
+		}
+	}
+}
+
+func TestWinPathFilters(t *testing.T) {
+	e := New()
+	got, err := e.Render(`{{ 'foo/bar' | win_basename }}`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "bar" {
+		t.Errorf("win_basename = %q, want %q", got, "bar")
+	}
+
+	got, err = e.Render(`{{ 'C:\\foo\\bar' | win_dirname }}`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != `C:\foo` {
+		t.Errorf("win_dirname = %q, want %q", got, `C:\foo`)
+	}
+
+	gotVal, err := e.RenderValue(`{{ 'C:\\foo\\bar' | win_splitdrive }}`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	list := gotVal.([]any)
+	if list[0] != "C:" || list[1] != `\foo\bar` {
+		t.Errorf("win_splitdrive = %#v, want (%q, %q)", list, "C:", `\foo\bar`)
+	}
+
+	gotVal, err = e.RenderValue(`{{ '\\\\server\\share\\a\\b' | win_splitdrive }}`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	list = gotVal.([]any)
+	if list[0] != `\\server\share` || list[1] != `\a\b` {
+		t.Errorf(`win_splitdrive(UNC) = %#v, want (%q, %q)`, list, `\\server\share`, `\a\b`)
+	}
+
+	gotVal, err = e.RenderValue(`{{ 'relative\\path' | win_splitdrive }}`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	list = gotVal.([]any)
+	if list[0] != "" || list[1] != `relative\path` {
+		t.Errorf("win_splitdrive(relative) = %#v, want (%q, %q)", list, "", `relative\path`)
+	}
+
+	// A rooted-relative path (no drive) and two malformed/incomplete UNC
+	// forms (missing the share separator entirely).
+	gotVal, err = e.RenderValue(`{{ '\\Windows' | win_splitdrive }}`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	list = gotVal.([]any)
+	if list[0] != "" || list[1] != `\Windows` {
+		t.Errorf("win_splitdrive(rooted, no drive) = %#v, want (%q, %q)", list, "", `\Windows`)
+	}
+
+	gotVal, err = e.RenderValue(`{{ '\\\\server' | win_splitdrive }}`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	list = gotVal.([]any)
+	if list[0] != `\\server` || list[1] != "" {
+		t.Errorf("win_splitdrive(UNC, no share separator) = %#v, want (%q, %q)", list, `\\server`, "")
+	}
+
+	gotVal, err = e.RenderValue(`{{ '\\\\server\\share' | win_splitdrive }}`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	list = gotVal.([]any)
+	if list[0] != `\\server\share` || list[1] != "" {
+		t.Errorf("win_splitdrive(UNC, no trailing separator) = %#v, want (%q, %q)", list, `\\server\share`, "")
+	}
+}
+
+func TestCommentFilter(t *testing.T) {
+	e := New()
+	got, err := e.Render("{{ text | comment }}", map[string]any{"text": "hello\nworld"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "#\n# hello\n# world\n#"; got != want {
+		t.Errorf("comment(plain) = %q, want %q", got, want)
+	}
+
+	got, err = e.Render("{{ text | comment('cblock') }}", map[string]any{"text": "hello\nworld"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "/*\n *\n * hello\n * world\n *\n */"; got != want {
+		t.Errorf("comment(cblock) = %q, want %q", got, want)
+	}
+
+	got, err = e.Render("{{ text | comment('plain', decoration='## ') }}", map[string]any{"text": "hi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "##\n## hi\n##"; got != want {
+		t.Errorf("comment with decoration override = %q, want %q", got, want)
+	}
+
+	if _, err := e.Eval(`'x' | comment('not-a-real-style')`, nil); err == nil {
+		t.Fatal("comment with an unknown style: got nil error, want one")
+	}
+
+	// erlang/xml styles, style given as a keyword, and prefix_count > 1.
+	got, err = e.Render("{{ 'hi' | comment(style='erlang') }}", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "%\n% hi\n%"; got != want {
+		t.Errorf("comment(style='erlang') = %q, want %q", got, want)
+	}
+
+	got, err = e.Render("{{ 'hi' | comment('xml') }}", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "<!--\n -\n - hi\n -\n-->"; got != want {
+		t.Errorf("comment('xml') = %q, want %q", got, want)
+	}
+
+	got, err = e.Render("{{ 'hi' | comment('plain', prefix_count=2) }}", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "#\n#\n# hi\n#"; got != want {
+		t.Errorf("comment(prefix_count=2) = %q, want %q", got, want)
+	}
+
+	// A blank line in the text produces a line that is just the
+	// decorator, whose trailing space real Ansible strips.
+	got, err = e.Render("{{ text | comment }}", map[string]any{"text": "a\n\nb"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "#\n# a\n#\n# b\n#"; got != want {
+		t.Errorf("comment with a blank line = %q, want %q", got, want)
 	}
 }

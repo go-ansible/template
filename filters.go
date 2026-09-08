@@ -4,15 +4,21 @@ import (
 	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"math"
-	"path"
+	"os"
+	"os/user"
+	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"regexp"
 
@@ -55,9 +61,27 @@ func registerFilters(filters *exec.FilterSet) {
 
 	must("b64encode", filterB64Encode)
 	must("b64decode", filterB64Decode)
+	sha1Hex := func(b []byte) string { s := sha1.Sum(b); return hex.EncodeToString(s[:]) }
 	must("md5", filterHash(func(b []byte) string { s := md5.Sum(b); return hex.EncodeToString(s[:]) }))
-	must("sha1", filterHash(func(b []byte) string { s := sha1.Sum(b); return hex.EncodeToString(s[:]) }))
-	must("hash", filterHash(func(b []byte) string { s := sha256.Sum256(b); return hex.EncodeToString(s[:]) }))
+	must("sha1", filterHash(sha1Hex))
+	// checksum is real Ansible's own alias for sha1 (ansible.utils.hashing's
+	// checksum_s defaults to sha1) — the same digest, a different name.
+	must("checksum", filterHash(sha1Hex))
+	must("hash", filterHashGeneric)
+
+	must("path_join", filterPathJoin)
+	must("splitext", filterSplitext)
+	must("expanduser", filterExpandUser)
+	must("expandvars", filterExpandVars)
+	must("realpath", filterRealpath)
+	must("relpath", filterRelpath)
+	must("normpath", filterNormpath)
+	must("commonpath", filterCommonpath)
+	must("win_basename", filterWinBasename)
+	must("win_dirname", filterWinDirname)
+	must("win_splitdrive", filterWinSplitdrive)
+
+	must("comment", filterComment)
 
 	// "unique" is deliberately not registered here: gonja's own builtin
 	// already implements Jinja2's do_unique (case_sensitive/attribute
@@ -336,12 +360,31 @@ func filterQuote(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.
 	return exec.AsValue(s)
 }
 
+// posixSplit ports posixpath.split(p) exactly: tail is everything after the
+// final "/" (empty if p ends in "/"), head is everything before it with any
+// trailing "/"es stripped (unless head is all slashes, i.e. the root).
+// Deliberately NOT Go's path.Base/path.Dir, which Clean the result first —
+// a real, previously-shipped divergence from Python found while porting the
+// rest of this file's path filters: path.Base("/foo/bar/") is "bar" where
+// Python's basename is "" (empty), and path.Dir("foo")/path.Base("") are
+// "." where Python's dirname/basename are "" (empty).
+func posixSplit(p string) (head, tail string) {
+	i := strings.LastIndexByte(p, '/') + 1
+	head, tail = p[:i], p[i:]
+	if head != "" && strings.Trim(head, "/") != "" {
+		head = strings.TrimRight(head, "/")
+	}
+	return head, tail
+}
+
 func filterBasename(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
-	return exec.AsValue(path.Base(in.String()))
+	_, tail := posixSplit(in.String())
+	return exec.AsValue(tail)
 }
 
 func filterDirname(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
-	return exec.AsValue(path.Dir(in.String()))
+	head, _ := posixSplit(in.String())
+	return exec.AsValue(head)
 }
 
 func filterB64Encode(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
@@ -744,4 +787,495 @@ func filterToUUID(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec
 		namespace = ns
 	}
 	return exec.AsValue(uuidV5(namespace, in.String()))
+}
+
+// hashConstructors covers the hashlib names real Ansible's own generic
+// "hash" filter is documented and commonly used with.
+var hashConstructors = map[string]func() hash.Hash{
+	"md5":    md5.New,
+	"sha1":   sha1.New,
+	"sha224": sha256.New224,
+	"sha256": sha256.New,
+	"sha384": sha512.New384,
+	"sha512": sha512.New,
+}
+
+// filterHashGeneric ports real Ansible's own "hash" filter: get_hash(data,
+// hashtype='sha1') — defaults to sha1 (NOT sha256, a real bug in this port
+// found and fixed while reading core.py's own filters() registration:
+// 'hash': get_hash defaults hashtype='sha1', confirmed from source), and
+// accepts an algorithm name as an optional argument.
+func filterHashGeneric(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	hashtype := "sha1"
+	if len(params.Args) > 0 {
+		hashtype = params.Args[0].String()
+	} else if kw, ok := params.KwArgs["hashtype"]; ok {
+		hashtype = kw.String()
+	}
+	newHash, ok := hashConstructors[strings.ToLower(hashtype)]
+	if !ok {
+		names := make([]string, 0, len(hashConstructors))
+		for name := range hashConstructors {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		return exec.ValueError(fmt.Errorf("hash: unsupported hash type %q, must be one of %s", hashtype, strings.Join(names, ", ")))
+	}
+	h := newHash()
+	h.Write([]byte(in.String()))
+	return exec.AsValue(hex.EncodeToString(h.Sum(nil)))
+}
+
+// --- Path filters ---
+//
+// Ported from real ansible-core's own core.py path section, which is
+// itself a thin wrap over Python's os.path (posixpath on the Linux/macOS
+// controllers this port targets) and ntpath (for the win_* filters). Real
+// Python's stdlib source (posixpath.py/ntpath.py/genericpath.py) was read
+// directly as the bibliography here, since these filters ARE that stdlib
+// behavior, not a separate Ansible algorithm. Implemented independent of
+// Go's os/path/filepath packages' own OS-dependent Clean-ing (see
+// posixSplit's own comment) so behavior stays POSIX regardless of GOOS.
+
+// posixSplitRoot ports posixpath's splitroot: root is "" for a relative
+// path, "/" for one or 3+ leading slashes, or "//" for EXACTLY two — a real
+// POSIX-defined special case (see IEEE Std 1003.1) normpath must preserve.
+func posixSplitRoot(p string) (root, tail string) {
+	if !strings.HasPrefix(p, "/") {
+		return "", p
+	}
+	if !strings.HasPrefix(p, "//") || strings.HasPrefix(p, "///") {
+		return "/", p[1:]
+	}
+	return "//", p[2:]
+}
+
+func posixNormpath(p string) string {
+	if p == "" {
+		return "."
+	}
+	root, tail := posixSplitRoot(p)
+	comps := strings.Split(tail, "/")
+	newComps := make([]string, 0, len(comps))
+	for _, comp := range comps {
+		switch {
+		case comp == "" || comp == ".":
+			continue
+		case comp != ".." || (root == "" && len(newComps) == 0) || (len(newComps) > 0 && newComps[len(newComps)-1] == ".."):
+			newComps = append(newComps, comp)
+		case len(newComps) > 0:
+			newComps = newComps[:len(newComps)-1]
+		}
+	}
+	result := root + strings.Join(newComps, "/")
+	if result == "" {
+		return "."
+	}
+	return result
+}
+
+func posixJoin(paths []string) string {
+	if len(paths) == 0 {
+		return ""
+	}
+	out := paths[0]
+	for _, b := range paths[1:] {
+		switch {
+		case strings.HasPrefix(b, "/") || out == "":
+			out = b
+		case strings.HasSuffix(out, "/"):
+			out += b
+		default:
+			out += "/" + b
+		}
+	}
+	return out
+}
+
+func posixAbspath(p string) string {
+	if !strings.HasPrefix(p, "/") {
+		if wd, err := os.Getwd(); err == nil {
+			p = posixJoin([]string{wd, p})
+		}
+	}
+	return posixNormpath(p)
+}
+
+func filterPathJoin(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	if in.IsString() {
+		// Real path_join(paths) calls os.path.join(paths) with a single
+		// arg when paths is a string — an identity no-op, no join logic
+		// ever runs.
+		return exec.AsValue(in.String())
+	}
+	list := toList(in)
+	if list == nil {
+		return exec.ValueError(fmt.Errorf("path_join expects a string or a list, got %T", in.Interface()))
+	}
+	parts := make([]string, len(list))
+	for i, v := range list {
+		parts[i] = fmt.Sprintf("%v", v)
+	}
+	return exec.AsValue(posixJoin(parts))
+}
+
+func filterNormpath(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	return exec.AsValue(posixNormpath(in.String()))
+}
+
+func filterRealpath(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	abs := posixAbspath(in.String())
+	// Real os.path.realpath resolves symlinks component-by-component,
+	// tolerating a nonexistent trailing component. filepath.EvalSymlinks
+	// instead errors on any nonexistent component; falling back to the
+	// plain absolute+normalized path there is a disclosed simplification
+	// for that one edge case, not a literal reproduction of Python's own
+	// partial-resolution algorithm.
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return exec.AsValue(resolved)
+	}
+	return exec.AsValue(abs)
+}
+
+func filterRelpath(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	start := "."
+	if len(params.Args) > 0 {
+		start = params.Args[0].String()
+	}
+	startTail := strings.TrimLeft(posixAbspath(start), "/")
+	pathTail := strings.TrimLeft(posixAbspath(in.String()), "/")
+	var startList, pathList []string
+	if startTail != "" {
+		startList = strings.Split(startTail, "/")
+	}
+	if pathTail != "" {
+		pathList = strings.Split(pathTail, "/")
+	}
+	i := 0
+	for i < len(startList) && i < len(pathList) && startList[i] == pathList[i] {
+		i++
+	}
+	relList := make([]string, 0, (len(startList)-i)+(len(pathList)-i))
+	for k := 0; k < len(startList)-i; k++ {
+		relList = append(relList, "..")
+	}
+	relList = append(relList, pathList[i:]...)
+	if len(relList) == 0 {
+		return exec.AsValue(".")
+	}
+	return exec.AsValue(strings.Join(relList, "/"))
+}
+
+// genericSplitext ports genericpath._splitext: the extension is everything
+// from the last dot to the end, ignoring leading dots (so ".bashrc" and
+// "..bashrc" have NO extension, but "a." does — an empty name before a
+// trailing dot still counts).
+func genericSplitext(p, seps string) (root, ext string) {
+	sepIndex := strings.LastIndexAny(p, seps)
+	dotIndex := strings.LastIndexByte(p, '.')
+	if dotIndex > sepIndex {
+		filenameIndex := sepIndex + 1
+		for filenameIndex < dotIndex {
+			if p[filenameIndex] != '.' {
+				return p[:dotIndex], p[dotIndex:]
+			}
+			filenameIndex++
+		}
+	}
+	return p, ""
+}
+
+func filterSplitext(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	root, ext := genericSplitext(in.String(), "/")
+	return exec.AsValue([]any{root, ext})
+}
+
+func filterCommonpath(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	list := toList(in)
+	if len(list) == 0 {
+		return exec.ValueError(fmt.Errorf("commonpath() arg is an empty sequence"))
+	}
+	paths := make([]string, len(list))
+	for i, v := range list {
+		paths[i] = fmt.Sprintf("%v", v)
+	}
+	isAbs := strings.HasPrefix(paths[0], "/")
+	for _, p := range paths {
+		if strings.HasPrefix(p, "/") != isAbs {
+			return exec.ValueError(fmt.Errorf("commonpath: can't mix absolute and relative paths"))
+		}
+	}
+	splitPaths := make([][]string, len(paths))
+	for i, p := range paths {
+		filtered := make([]string, 0, len(paths))
+		for _, c := range strings.Split(p, "/") {
+			if c != "" && c != "." {
+				filtered = append(filtered, c)
+			}
+		}
+		splitPaths[i] = filtered
+	}
+	minIdx, maxIdx := 0, 0
+	for i := 1; i < len(splitPaths); i++ {
+		if lessStringSlice(splitPaths[i], splitPaths[minIdx]) {
+			minIdx = i
+		}
+		if lessStringSlice(splitPaths[maxIdx], splitPaths[i]) {
+			maxIdx = i
+		}
+	}
+	s1, s2 := splitPaths[minIdx], splitPaths[maxIdx]
+	common := s1
+	for i, c := range s1 {
+		if i >= len(s2) || c != s2[i] {
+			common = s1[:i]
+			break
+		}
+	}
+	prefix := ""
+	if isAbs {
+		prefix = "/"
+	}
+	return exec.AsValue(prefix + strings.Join(common, "/"))
+}
+
+func lessStringSlice(a, b []string) bool {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if a[i] != b[i] {
+			return a[i] < b[i]
+		}
+	}
+	return len(a) < len(b)
+}
+
+// expandUserHome finds the current user's home directory the same way real
+// Python's expanduser does for bare "~": prefer $HOME, fall back to the
+// password database (os/user.Current, which itself consults getpwuid on
+// POSIX) — unlike Go's own os.UserHomeDir, which only ever checks $HOME.
+func expandUserHome() (string, error) {
+	if h := os.Getenv("HOME"); h != "" {
+		return h, nil
+	}
+	if u, err := user.Current(); err == nil && u.HomeDir != "" {
+		return u.HomeDir, nil
+	}
+	return "", fmt.Errorf("no home directory")
+}
+
+func filterExpandUser(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	p := in.String()
+	if !strings.HasPrefix(p, "~") {
+		return exec.AsValue(p)
+	}
+	i := strings.IndexByte(p, '/')
+	if i < 0 {
+		i = len(p)
+	}
+	var home string
+	if i == 1 {
+		h, err := expandUserHome()
+		if err != nil {
+			return exec.AsValue(p)
+		}
+		home = h
+	} else {
+		u, err := user.Lookup(p[1:i])
+		if err != nil {
+			return exec.AsValue(p)
+		}
+		home = u.HomeDir
+	}
+	home = strings.TrimRight(home, "/")
+	rest := p[i:]
+	if home == "" && rest == "" {
+		return exec.AsValue("/")
+	}
+	return exec.AsValue(home + rest)
+}
+
+var expandVarsRe = regexp.MustCompile(`\$(\w+|\{[^}]*\}?)`)
+
+func filterExpandVars(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	p := in.String()
+	if !strings.Contains(p, "$") {
+		return exec.AsValue(p)
+	}
+	return exec.AsValue(expandVarsRe.ReplaceAllStringFunc(p, func(m string) string {
+		name := m[1:]
+		if strings.HasPrefix(name, "{") {
+			if !strings.HasSuffix(name, "}") {
+				return m
+			}
+			name = name[1 : len(name)-1]
+		}
+		if v, ok := os.LookupEnv(name); ok {
+			return v
+		}
+		return m
+	}))
+}
+
+// ntSplitRoot ports ntpath's splitroot for the common cases: a drive
+// letter ("C:\...", "C:..."), a UNC/device share ("\\server\share\...",
+// "\\.\device\..."), a rooted-relative path ("\Windows"), and a plain
+// relative path. The rare "\\?\UNC\server\share" extended-length-prefix
+// form is a disclosed simplification NOT specially detected (it falls
+// through as an ordinary UNC-shaped path instead) — narrow enough in
+// practice not to warrant the extra 8-char prefix check real ntpath does.
+func ntSplitRoot(p string) (drive, root, tail string) {
+	normp := strings.ReplaceAll(p, "/", `\`)
+	switch {
+	case strings.HasPrefix(normp, `\`):
+		if !strings.HasPrefix(normp[1:], `\`) {
+			return "", p[:1], p[1:]
+		}
+		idx := strings.Index(normp[2:], `\`)
+		if idx == -1 {
+			return p, "", ""
+		}
+		idx += 2
+		idx2 := strings.Index(normp[idx+1:], `\`)
+		if idx2 == -1 {
+			return p, "", ""
+		}
+		idx2 += idx + 1
+		return p[:idx2], p[idx2 : idx2+1], p[idx2+1:]
+	case len(normp) > 1 && normp[1] == ':':
+		if len(normp) > 2 && normp[2] == '\\' {
+			return p[:2], p[2:3], p[3:]
+		}
+		return p[:2], "", p[2:]
+	default:
+		return "", "", p
+	}
+}
+
+func ntSplit(p string) (head, tail string) {
+	drive, root, rest := ntSplitRoot(p)
+	i := len(rest)
+	for i > 0 && rest[i-1] != '\\' && rest[i-1] != '/' {
+		i--
+	}
+	head, tail = rest[:i], rest[i:]
+	return drive + root + strings.TrimRight(head, `\/`), tail
+}
+
+func filterWinBasename(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	_, tail := ntSplit(in.String())
+	return exec.AsValue(tail)
+}
+
+func filterWinDirname(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	head, _ := ntSplit(in.String())
+	return exec.AsValue(head)
+}
+
+func filterWinSplitdrive(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	drive, root, tail := ntSplitRoot(in.String())
+	return exec.AsValue([]any{drive, root + tail})
+}
+
+// --- comment filter ---
+
+type commentStyle struct{ beginning, decoration, end string }
+
+// commentStyleNames preserves real Ansible's own dict-insertion order
+// (plain, erlang, c, cblock, xml) for the "invalid style" error message,
+// since map iteration order in Go is random.
+var commentStyleNames = []string{"plain", "erlang", "c", "cblock", "xml"}
+
+var commentStyles = map[string]commentStyle{
+	"plain":  {decoration: "# "},
+	"erlang": {decoration: "% "},
+	"c":      {decoration: "// "},
+	"cblock": {beginning: "/*", decoration: " * ", end: " */"},
+	"xml":    {beginning: "<!--", decoration: " - ", end: "-->"},
+}
+
+// filterComment ports real ansible-core's own comment() filter, a fiddly
+// but fully deterministic string-composition function — traced by hand
+// against real Ansible's documented plain/cblock examples before writing
+// the Go version, not just transliterated line-by-line.
+func filterComment(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	style := "plain"
+	if len(params.Args) > 0 {
+		style = params.Args[0].String()
+	} else if kw, ok := params.KwArgs["style"]; ok {
+		style = kw.String()
+	}
+	styleParams, ok := commentStyles[style]
+	if !ok {
+		return exec.ValueError(fmt.Errorf("comment: invalid style %q. Available styles: %s", style, strings.Join(commentStyleNames, ", ")))
+	}
+
+	prepostfix := styleParams.decoration
+	if kw, ok := params.KwArgs["decoration"]; ok {
+		prepostfix = kw.String()
+	}
+
+	newline := "\n"
+	if kw, ok := params.KwArgs["newline"]; ok {
+		newline = kw.String()
+	}
+	beginning := styleParams.beginning
+	if kw, ok := params.KwArgs["beginning"]; ok {
+		beginning = kw.String()
+	}
+	prefix := strings.TrimRightFunc(prepostfix, unicode.IsSpace)
+	if kw, ok := params.KwArgs["prefix"]; ok {
+		prefix = kw.String()
+	}
+	prefixCount := 1
+	if kw, ok := params.KwArgs["prefix_count"]; ok {
+		prefixCount = kw.Integer()
+	}
+	decoration := styleParams.decoration
+	if kw, ok := params.KwArgs["decoration"]; ok {
+		decoration = kw.String()
+	}
+	postfix := strings.TrimRightFunc(prepostfix, unicode.IsSpace)
+	if kw, ok := params.KwArgs["postfix"]; ok {
+		postfix = kw.String()
+	}
+	postfixCount := 1
+	if kw, ok := params.KwArgs["postfix_count"]; ok {
+		postfixCount = kw.Integer()
+	}
+	end := styleParams.end
+	if kw, ok := params.KwArgs["end"]; ok {
+		end = kw.String()
+	}
+
+	text := in.String()
+
+	var strBeginning string
+	if beginning != "" {
+		strBeginning = beginning + newline
+	}
+
+	var strPrefix string
+	if prefix != "" {
+		if prefix != newline {
+			strPrefix = strings.Repeat(prefix+newline, prefixCount)
+		} else {
+			strPrefix = strings.Repeat(newline, prefixCount)
+		}
+	}
+
+	strText := decoration + strings.ReplaceAll(text, newline, newline+decoration)
+	strText = strings.ReplaceAll(strText, decoration+newline, strings.TrimRightFunc(decoration, unicode.IsSpace)+newline)
+
+	postfixParts := make([]string, 0, postfixCount+1)
+	postfixParts = append(postfixParts, "")
+	for i := 0; i < postfixCount; i++ {
+		postfixParts = append(postfixParts, postfix)
+	}
+	strPostfix := strings.Join(postfixParts, newline)
+
+	var strEnd string
+	if end != "" {
+		strEnd = newline + end
+	}
+
+	return exec.AsValue(strBeginning + strPrefix + strText + strPostfix + strEnd)
 }
