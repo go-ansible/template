@@ -318,6 +318,100 @@ func TestRenderValueErrorPropagatesFromList(t *testing.T) {
 	}
 }
 
+func TestOmitDropsMapKey(t *testing.T) {
+	e := New()
+	got, err := e.RenderValue(map[string]any{
+		"present": "{{ x | default(omit) }}",
+		"missing": "{{ y | default(omit) }}",
+	}, map[string]any{"x": "set"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := got.(map[string]any)
+	if m["present"] != "set" {
+		t.Errorf(`m["present"] = %#v, want "set"`, m["present"])
+	}
+	if _, ok := m["missing"]; ok {
+		t.Errorf(`m["missing"] = %#v, want the key entirely absent`, m["missing"])
+	}
+	if len(m) != 1 {
+		t.Errorf("map = %#v, want exactly 1 key", m)
+	}
+}
+
+func TestOmitDropsListItem(t *testing.T) {
+	e := New()
+	got, err := e.RenderValue([]any{
+		"a", "{{ y | default(omit) }}", "b",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	list := got.([]any)
+	if len(list) != 2 || list[0] != "a" || list[1] != "b" {
+		t.Errorf("list = %#v, want [a b] (the omitted item dropped)", list)
+	}
+}
+
+func TestOmitBooleanDefault(t *testing.T) {
+	// default(omit, true) only substitutes when the input is falsy, not
+	// merely undefined — gonja's own filterDefault already implements
+	// this generically (Omit is just whatever "default value" argument
+	// was given), so this doubles as regression coverage that the omit
+	// global doesn't need special-casing inside the filter itself.
+	e := New()
+	got, err := e.RenderValue(map[string]any{
+		"falsy":  "{{ x | default(omit, true) }}",
+		"truthy": "{{ y | default(omit, true) }}",
+	}, map[string]any{"x": "", "y": "set"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := got.(map[string]any)
+	if _, ok := m["falsy"]; ok {
+		t.Errorf(`m["falsy"] = %#v, want omitted (empty string is falsy)`, m["falsy"])
+	}
+	if m["truthy"] != "set" {
+		t.Errorf(`m["truthy"] = %#v, want "set"`, m["truthy"])
+	}
+}
+
+func TestOmitNestedInStructure(t *testing.T) {
+	e := New()
+	got, err := e.RenderValue(map[string]any{
+		"outer": map[string]any{
+			"keep": "{{ x }}",
+			"drop": "{{ y | default(omit) }}",
+		},
+	}, map[string]any{"x": "v"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outer := got.(map[string]any)["outer"].(map[string]any)
+	if outer["keep"] != "v" {
+		t.Errorf(`outer["keep"] = %#v`, outer["keep"])
+	}
+	if _, ok := outer["drop"]; ok {
+		t.Errorf(`outer["drop"] = %#v, want omitted`, outer["drop"])
+	}
+}
+
+func TestOmitBareTopLevelIsError(t *testing.T) {
+	e := New()
+	if _, err := e.RenderValue("{{ omit }}", nil); err == nil {
+		t.Fatal("RenderValue on a bare omit with nothing to omit it from: got nil error, want one")
+	}
+	// The same value reached through Eval (no container-dropping concept
+	// at that level) is not an error — it's a legitimate native value.
+	got, err := e.Eval("omit", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !IsOmit(got) {
+		t.Errorf("Eval(\"omit\") = %#v, want the omit sentinel", got)
+	}
+}
+
 func TestIsTemplate(t *testing.T) {
 	if !IsTemplate("{{ x }}") {
 		t.Error("{{ x }} should be a template")

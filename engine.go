@@ -39,8 +39,13 @@ func New() *Engine {
 	tests := exec.NewTestSet(map[string]exec.TestFunction{}).Update(builtins.Tests)
 	registerTests(tests)
 
+	// "omit" is Ansible's own sentinel global — {{ x | default(omit) }}
+	// evaluates to Omit when x is undefined, and RenderValue drops the
+	// containing map key or list item for it (see omit.go).
+	globals := exec.NewContext(map[string]any{"omit": Omit})
+
 	env := &exec.Environment{
-		Context:           exec.EmptyContext().Update(builtins.GlobalFunctions).Update(builtins.GlobalVariables),
+		Context:           exec.EmptyContext().Update(builtins.GlobalFunctions).Update(builtins.GlobalVariables).Update(globals),
 		Filters:           filters,
 		Tests:             tests,
 		ControlStructures: builtins.ControlStructures,
@@ -149,7 +154,26 @@ func (e *Engine) evalValue(exprSrc string, data map[string]any) (*exec.Value, er
 // preserving native types), and lists/maps are walked recursively so a
 // nested `{{ }}` anywhere in a task's arguments is resolved. Non-string
 // scalars pass through unchanged.
+//
+// A value that renders to Omit (see omit.go — typically reached via
+// `default(omit)`) is dropped entirely: from a map, the whole key
+// disappears; from a list, the item disappears — matching real Ansible's
+// own "Omit values remaining in template results will be automatically
+// dropped during template finalization." A bare top-level result of
+// exactly Omit, with no containing map or list to drop it from, is an
+// error, matching real Ansible's own AnsibleValueOmittedError.
 func (e *Engine) RenderValue(raw any, data map[string]any) (any, error) {
+	out, err := e.renderValue(raw, data)
+	if err != nil {
+		return nil, err
+	}
+	if IsOmit(out) {
+		return nil, fmt.Errorf("template: omit has no containing list or dict entry to omit it from")
+	}
+	return out, nil
+}
+
+func (e *Engine) renderValue(raw any, data map[string]any) (any, error) {
 	switch v := raw.(type) {
 	case string:
 		if !IsTemplate(v) {
@@ -162,21 +186,27 @@ func (e *Engine) RenderValue(raw any, data map[string]any) (any, error) {
 	case map[string]any:
 		out := make(map[string]any, len(v))
 		for k, item := range v {
-			rendered, err := e.RenderValue(item, data)
+			rendered, err := e.renderValue(item, data)
 			if err != nil {
 				return nil, err
+			}
+			if IsOmit(rendered) {
+				continue
 			}
 			out[k] = rendered
 		}
 		return out, nil
 	case []any:
-		out := make([]any, len(v))
-		for i, item := range v {
-			rendered, err := e.RenderValue(item, data)
+		out := make([]any, 0, len(v))
+		for _, item := range v {
+			rendered, err := e.renderValue(item, data)
 			if err != nil {
 				return nil, err
 			}
-			out[i] = rendered
+			if IsOmit(rendered) {
+				continue
+			}
+			out = append(out, rendered)
 		}
 		return out, nil
 	default:
