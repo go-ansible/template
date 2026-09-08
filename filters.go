@@ -101,6 +101,16 @@ func registerFilters(filters *exec.FilterSet) {
 	must("rekey_on_member", filterRekeyOnMember)
 
 	must("to_uuid", filterToUUID)
+
+	// mathstuff.py's own combinatorial section registers Python's
+	// itertools functions (and the zip builtin) directly, with no
+	// Ansible-specific wrapper — real filter calls carry their exact
+	// Python calling convention straight through.
+	must("product", filterProduct)
+	must("permutations", filterPermutations)
+	must("combinations", filterCombinations)
+	must("zip", filterZip)
+	must("zip_longest", filterZipLongest)
 }
 
 func filterToJSON(indent bool) exec.FilterFunction {
@@ -1278,4 +1288,224 @@ func filterComment(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exe
 	}
 
 	return exec.AsValue(strBeginning + strPrefix + strText + strPostfix + strEnd)
+}
+
+// --- Combinatorial filters ---
+//
+// mathstuff.py registers Python's itertools.product/permutations/
+// combinations and the zip/itertools.zip_longest builtins directly as
+// filters, with no Ansible-specific wrapper function at all — so what
+// these filters need to match is Python's own algorithms, including their
+// exact OUTPUT ORDER (a caller may depend on it), not just their result
+// set. Each generator below is a direct, hand-traced port of the iterative
+// algorithm documented for that itertools function, verified by tracing
+// permutations([1,2,3], 2) and comparing against real Python's own
+// documented output before trusting it.
+
+func cartesianProduct(iterables [][]any) [][]any {
+	result := [][]any{{}}
+	for _, it := range iterables {
+		next := make([][]any, 0, len(result)*len(it))
+		for _, r := range result {
+			for _, v := range it {
+				tuple := make([]any, len(r)+1)
+				copy(tuple, r)
+				tuple[len(r)] = v
+				next = append(next, tuple)
+			}
+		}
+		result = next
+	}
+	return result
+}
+
+func filterProduct(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	base := [][]any{toList(in)}
+	for _, arg := range params.Args {
+		base = append(base, toList(arg))
+	}
+	repeat := 1
+	if kw, ok := params.KwArgs["repeat"]; ok {
+		repeat = kw.Integer()
+	}
+	iterables := make([][]any, 0, len(base)*repeat)
+	for i := 0; i < repeat; i++ {
+		iterables = append(iterables, base...)
+	}
+	tuples := cartesianProduct(iterables)
+	out := make([]any, len(tuples))
+	for i, t := range tuples {
+		out[i] = t
+	}
+	return exec.AsValue(out)
+}
+
+// permutationsOf ports itertools.permutations' own documented iterative
+// algorithm (index-cycling, not a naive recursive generator) to guarantee
+// the exact same output order real Python produces.
+func permutationsOf(pool []any, r int) [][]any {
+	n := len(pool)
+	if r < 0 || r > n {
+		return nil
+	}
+	if r == 0 {
+		return [][]any{{}}
+	}
+	indices := make([]int, n)
+	for i := range indices {
+		indices[i] = i
+	}
+	cycles := make([]int, r)
+	for i := 0; i < r; i++ {
+		cycles[i] = n - i
+	}
+	emit := func() []any {
+		tuple := make([]any, r)
+		for i := 0; i < r; i++ {
+			tuple[i] = pool[indices[i]]
+		}
+		return tuple
+	}
+	result := [][]any{emit()}
+	for {
+		advanced := false
+		for i := r - 1; i >= 0; i-- {
+			cycles[i]--
+			if cycles[i] == 0 {
+				rest := append(append([]int{}, indices[i+1:]...), indices[i])
+				copy(indices[i:], rest)
+				cycles[i] = n - i
+			} else {
+				j := cycles[i]
+				indices[i], indices[n-j] = indices[n-j], indices[i]
+				result = append(result, emit())
+				advanced = true
+				break
+			}
+		}
+		if !advanced {
+			break
+		}
+	}
+	return result
+}
+
+func filterPermutations(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	list := toList(in)
+	r := len(list)
+	if len(params.Args) > 0 {
+		r = params.Args[0].Integer()
+	} else if kw, ok := params.KwArgs["r"]; ok {
+		r = kw.Integer()
+	}
+	tuples := permutationsOf(list, r)
+	out := make([]any, len(tuples))
+	for i, t := range tuples {
+		out[i] = t
+	}
+	return exec.AsValue(out)
+}
+
+// combinationsOf ports itertools.combinations' own documented iterative
+// algorithm, same rationale as permutationsOf.
+func combinationsOf(pool []any, r int) [][]any {
+	n := len(pool)
+	if r < 0 || r > n {
+		return nil
+	}
+	indices := make([]int, r)
+	for i := range indices {
+		indices[i] = i
+	}
+	emit := func() []any {
+		tuple := make([]any, r)
+		for i := 0; i < r; i++ {
+			tuple[i] = pool[indices[i]]
+		}
+		return tuple
+	}
+	result := [][]any{emit()}
+	for {
+		found := -1
+		for i := r - 1; i >= 0; i-- {
+			if indices[i] != i+n-r {
+				found = i
+				break
+			}
+		}
+		if found == -1 {
+			break
+		}
+		indices[found]++
+		for j := found + 1; j < r; j++ {
+			indices[j] = indices[j-1] + 1
+		}
+		result = append(result, emit())
+	}
+	return result
+}
+
+func filterCombinations(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	p := params.Expect(1, nil)
+	if p.IsError() {
+		return exec.ValueError(fmt.Errorf("%s", p.Error()))
+	}
+	tuples := combinationsOf(toList(in), p.Args[0].Integer())
+	out := make([]any, len(tuples))
+	for i, t := range tuples {
+		out[i] = t
+	}
+	return exec.AsValue(out)
+}
+
+func filterZip(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	lists := [][]any{toList(in)}
+	for _, arg := range params.Args {
+		lists = append(lists, toList(arg))
+	}
+	minLen := 0
+	for i, l := range lists {
+		if i == 0 || len(l) < minLen {
+			minLen = len(l)
+		}
+	}
+	out := make([]any, minLen)
+	for i := 0; i < minLen; i++ {
+		tuple := make([]any, len(lists))
+		for j, l := range lists {
+			tuple[j] = l[i]
+		}
+		out[i] = tuple
+	}
+	return exec.AsValue(out)
+}
+
+func filterZipLongest(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	lists := [][]any{toList(in)}
+	for _, arg := range params.Args {
+		lists = append(lists, toList(arg))
+	}
+	var fillvalue any
+	if kw, ok := params.KwArgs["fillvalue"]; ok {
+		fillvalue = kw.Interface()
+	}
+	maxLen := 0
+	for _, l := range lists {
+		if len(l) > maxLen {
+			maxLen = len(l)
+		}
+	}
+	out := make([]any, maxLen)
+	for i := 0; i < maxLen; i++ {
+		tuple := make([]any, len(lists))
+		for j, l := range lists {
+			if i < len(l) {
+				tuple[j] = l[i]
+			} else {
+				tuple[j] = fillvalue
+			}
+		}
+		out[i] = tuple
+	}
+	return exec.AsValue(out)
 }
