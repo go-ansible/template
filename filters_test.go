@@ -1415,3 +1415,47 @@ func TestSplitFilter(t *testing.T) {
 		})
 	}
 }
+
+func TestFileglobFilter(t *testing.T) {
+	e := New()
+	dir := t.TempDir()
+	for _, name := range []string{"a.txt", "b.txt", "c.log"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(filepath.Join(dir, "d.txt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := e.Eval(`p | fileglob`, map[string]any{"p": filepath.Join(dir, "*.txt")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	list, ok := got.([]any)
+	if !ok {
+		t.Fatalf("fileglob result type = %T, want []any", got)
+	}
+	names := make(map[string]bool, len(list))
+	for _, m := range list {
+		names[filepath.Base(m.(string))] = true
+	}
+	// a.txt and b.txt match and are regular files; d.txt matches the
+	// pattern but is a directory, so os.path.isfile (here, IsRegular)
+	// excludes it; c.log doesn't match *.txt at all.
+	if len(names) != 2 || !names["a.txt"] || !names["b.txt"] {
+		t.Errorf("fileglob(*.txt) = %#v, want exactly {a.txt, b.txt}", names)
+	}
+
+	got, err = e.Eval(`p | fileglob`, map[string]any{"p": filepath.Join(dir, "nosuchpattern-*.xyz")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if list := got.([]any); len(list) != 0 {
+		t.Errorf("fileglob with no matches = %#v, want an empty list (not an error)", list)
+	}
+
+	if _, err := e.Eval(`'[' | fileglob`, nil); err == nil {
+		t.Fatal("fileglob with a malformed pattern: got nil error, want one")
+	}
+}
