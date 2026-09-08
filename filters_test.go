@@ -1459,3 +1459,92 @@ func TestFileglobFilter(t *testing.T) {
 		t.Fatal("fileglob with a malformed pattern: got nil error, want one")
 	}
 }
+
+func TestToDatetimeFilter(t *testing.T) {
+	e := New()
+
+	// Reference values are real Python's own
+	// (datetime.strptime(s, fmt) - datetime(1970,1,1)).total_seconds().
+	got, err := e.Eval(`'2021-06-15 13:45:30' | to_datetime`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 1623764730.0 {
+		t.Errorf("to_datetime(default format) = %v, want 1623764730.0", got)
+	}
+
+	got, err = e.Eval(`'2021-06-15' | to_datetime('%Y-%m-%d')`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 1623715200.0 {
+		t.Errorf("to_datetime(custom format) = %v, want 1623715200.0", got)
+	}
+
+	got, err = e.Eval(`'2021-06-15' | to_datetime(format='%Y-%m-%d')`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 1623715200.0 {
+		t.Errorf("to_datetime(format=...) = %v, want 1623715200.0", got)
+	}
+
+	// Subtracting two to_datetime results gives the same elapsed-seconds
+	// value real Python's own (a - b).total_seconds() gives — the
+	// primary real use case this filter's own float representation is
+	// chosen to support (see filterToDatetime's own comment).
+	got, err = e.Eval(`('2021-06-15 13:45:30' | to_datetime) - ('1970-01-01 00:00:00' | to_datetime)`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 1623764730.0 {
+		t.Errorf("to_datetime subtraction = %v, want 1623764730.0", got)
+	}
+
+	if _, err := e.Eval(`'not a date' | to_datetime`, nil); err == nil {
+		t.Fatal("to_datetime on an unparseable string: got nil error, want one")
+	}
+	if _, err := e.Eval(`'2021-166' | to_datetime('%Y-%j')`, nil); err == nil {
+		t.Fatal("to_datetime with %j (no Go layout equivalent): got nil error, want one")
+	}
+}
+
+func TestStrftimeFilter(t *testing.T) {
+	e := New()
+
+	// Reference values are real Python's own
+	// datetime.fromtimestamp(second, tz=utc).strftime(format).
+	cases := []struct {
+		expr string
+		want string
+	}{
+		{`'%Y-%m-%d %H:%M:%S' | strftime(1623764730, utc=True)`, "2021-06-15 13:45:30"},
+		{`'%Y-%m-%d %H:%M:%S.%f' | strftime(1623764730.5, utc=True)`, "2021-06-15 13:45:30.500000"},
+		{`'%A %d %B %Y %I:%M %p' | strftime(1623764730.5, True)`, "Tuesday 15 June 2021 01:45 PM"},
+		{`'%a %b %y' | strftime(1623764730.5, utc=True)`, "Tue Jun 21"},
+		{`'%%literal%%' | strftime(1623764730, utc=True)`, "%literal%"},
+	}
+	for _, c := range cases {
+		t.Run(c.expr, func(t *testing.T) {
+			got, err := e.Eval(c.expr, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != c.want {
+				t.Errorf("%s = %q, want %q", c.expr, got, c.want)
+			}
+		})
+	}
+
+	got, err := e.Eval(`'%Y' | strftime`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s, ok := got.(string); !ok || len(s) != 4 {
+		t.Errorf("strftime with no second (current time) = %#v, want a 4-digit year", got)
+	}
+
+	if _, err := e.Eval(`'%j' | strftime(0, utc=True)`, nil); err == nil {
+		t.Fatal("strftime with %j (no Go layout equivalent): got nil error, want one")
+	}
+}

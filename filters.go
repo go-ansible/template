@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"regexp"
@@ -118,6 +119,9 @@ func registerFilters(filters *exec.FilterSet) {
 	must("split", filterSplit)
 
 	must("fileglob", filterFileglob)
+
+	must("to_datetime", filterToDatetime)
+	must("strftime", filterStrftime)
 }
 
 func filterToJSON(indent bool) exec.FilterFunction {
@@ -1761,4 +1765,142 @@ func filterFileglob(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *ex
 		}
 	}
 	return exec.AsValue(out)
+}
+
+// strftimeDirectives maps the common Python strptime/strftime %-directives
+// (core.py's to_datetime/strftime share the same directive vocabulary,
+// one parsing and one formatting) to Go's reference-time layout tokens.
+// %j (day of year) has no Go layout equivalent at all and is deliberately
+// absent, so it falls into the "unsupported directive" error path below
+// rather than being silently mishandled — the same fail-loud choice this
+// whole project makes elsewhere for a real, disclosed gap.
+var strftimeDirectives = map[byte]string{
+	'Y': "2006",
+	'y': "06",
+	'm': "01",
+	'd': "02",
+	'H': "15",
+	'I': "03",
+	'M': "04",
+	'S': "05",
+	'p': "PM",
+	'B': "January",
+	'b': "Jan",
+	'A': "Monday",
+	'a': "Mon",
+	'z': "-0700",
+	'Z': "MST",
+}
+
+// strftimeToGoLayout translates a Python %-directive format string into a
+// Go reference-time layout. %f (microseconds) has no standalone Go layout
+// token — Go only recognizes fractional seconds written directly adjacent
+// to the seconds field — so only the common "%S.%f"/"%S,%f" idiom is
+// specially handled; a bare %f elsewhere is an unsupported directive.
+func strftimeToGoLayout(format string) (string, error) {
+	var b strings.Builder
+	for i := 0; i < len(format); i++ {
+		if format[i] != '%' || i+1 >= len(format) {
+			b.WriteByte(format[i])
+			continue
+		}
+		directive := format[i+1]
+		i++
+		if directive == '%' {
+			b.WriteByte('%')
+			continue
+		}
+		if directive == 'S' && i+3 < len(format) && (format[i+1] == '.' || format[i+1] == ',') && format[i+2] == '%' && format[i+3] == 'f' {
+			b.WriteString("05")
+			b.WriteByte(format[i+1])
+			b.WriteString("000000")
+			i += 3
+			continue
+		}
+		layout, ok := strftimeDirectives[directive]
+		if !ok {
+			return "", fmt.Errorf("unsupported strftime directive %%%c", directive)
+		}
+		b.WriteString(layout)
+	}
+	return b.String(), nil
+}
+
+// filterToDatetime ports core.py's to_datetime(): datetime.strptime(string,
+// format). Real Ansible's result is a Python datetime object, meaningful
+// there for both subtraction (giving a timedelta) and direct printing.
+// gonja's own binary-operator evaluator only implements arithmetic for
+// numeric Values (confirmed by reading exec/evaluator.go's own Subtraction
+// case before choosing a representation here) — there is no hook this
+// port can add without touching gonja itself, out of scope for a filter.
+// So this returns the parsed time as a float64 Unix timestamp instead of
+// a time.Time: it stringifies differently than Python's own datetime repr
+// (a real, disclosed divergence), but (a|to_datetime) - (b|to_datetime)
+// and comparisons between two results now work correctly through gonja's
+// existing generic numeric operators — which is real Ansible's own
+// dominant use case for this filter (elapsed-time math between two parsed
+// dates), not direct printing. A format with no timezone directive parses
+// as UTC (Go's own default for a tz-less layout), matching how two naive
+// Python datetimes subtract to the same wall-clock delta regardless of
+// what epoch either implementation privately anchors it to.
+func filterToDatetime(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	format := "%Y-%m-%d %H:%M:%S"
+	if len(params.Args) > 0 {
+		format = params.Args[0].String()
+	} else if kw, ok := params.KwArgs["format"]; ok && !kw.IsNil() {
+		format = kw.String()
+	}
+	layout, err := strftimeToGoLayout(format)
+	if err != nil {
+		return exec.ValueError(fmt.Errorf("to_datetime: %w", err))
+	}
+	t, err := time.Parse(layout, in.String())
+	if err != nil {
+		return exec.ValueError(fmt.Errorf("to_datetime: %w", err))
+	}
+	return exec.AsValue(float64(t.UnixNano()) / 1e9)
+}
+
+// filterStrftime ports core.py's strftime(string_format, second=None,
+// utc=False): unusually for a filter, the piped-in value is the FORMAT
+// string, not the time — second/utc are the filter's own arguments,
+// matching real Ansible's own calling convention exactly
+// ({{ '%Y-%m-%d' | strftime(some_epoch) }}).
+func filterStrftime(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	format := in.String()
+
+	var second float64
+	hasSecond := false
+	if len(params.Args) > 0 {
+		second, hasSecond = params.Args[0].Float(), true
+	} else if kw, ok := params.KwArgs["second"]; ok && !kw.IsNil() {
+		second, hasSecond = kw.Float(), true
+	}
+
+	utc := false
+	if len(params.Args) > 1 {
+		utc = params.Args[1].IsTrue()
+	} else if kw, ok := params.KwArgs["utc"]; ok {
+		utc = kw.IsTrue()
+	}
+
+	var t time.Time
+	if hasSecond {
+		sec := int64(second)
+		nsec := int64((second - float64(sec)) * 1e9)
+		t = time.Unix(sec, nsec)
+	} else {
+		t = time.Now()
+	}
+	if utc {
+		t = t.UTC()
+	} else {
+		t = t.Local()
+	}
+
+	layout, err := strftimeToGoLayout(format)
+	if err != nil {
+		return exec.ValueError(fmt.Errorf("strftime: %w", err))
+	}
+	return exec.AsValue(t.Format(layout))
 }
