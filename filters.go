@@ -2,6 +2,7 @@ package template
 
 import (
 	"crypto/md5"
+	"crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
@@ -23,6 +24,7 @@ import (
 
 	"regexp"
 
+	"github.com/go-encryptions/unixcrypt"
 	pcre "github.com/go-regexp/engine"
 	"github.com/nikolalohinski/gonja/v2/exec"
 	"gopkg.in/yaml.v3"
@@ -69,6 +71,7 @@ func registerFilters(filters *exec.FilterSet) {
 	// checksum_s defaults to sha1) — the same digest, a different name.
 	must("checksum", filterHash(sha1Hex))
 	must("hash", filterHashGeneric)
+	must("password_hash", filterPasswordHash)
 
 	must("path_join", filterPathJoin)
 	must("splitext", filterSplitext)
@@ -1903,4 +1906,175 @@ func filterStrftime(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *ex
 		return exec.ValueError(fmt.Errorf("strftime: %w", err))
 	}
 	return exec.AsValue(t.Format(layout))
+}
+
+// passwordHashAlgo mirrors one entry of real Ansible's own
+// ansible.utils.encrypt.BaseHash.algorithms table exactly (crypt_id,
+// salt_size, implicit_rounds, salt_exact, implicit_ident — confirmed from
+// source): id is the crypt(3)/MCF identifier; saltSize is the max (or, when
+// saltExact, the exact) length a caller-supplied salt must have;
+// implicitRounds is the rounds (sha256/512) or cost (bcrypt) used when the
+// caller doesn't specify one — real Ansible's own default for sha256/512
+// (535000/656000) is deliberately far above crypt(3)'s own spec default of
+// 5000, so even the "no rounds given" case always prints a "rounds=N$"
+// prefix in the output, confirmed against real `openssl passwd`.
+type passwordHashAlgo struct {
+	id             string
+	saltSize       int
+	saltExact      bool
+	implicitRounds int
+	implicitIdent  string
+}
+
+var passwordHashAlgorithms = map[string]passwordHashAlgo{
+	"md5":          {id: "1", saltSize: 8},
+	"md5_crypt":    {id: "1", saltSize: 8},
+	"sha256":       {id: "5", saltSize: 16, implicitRounds: 535000},
+	"sha256_crypt": {id: "5", saltSize: 16, implicitRounds: 535000},
+	"sha512":       {id: "6", saltSize: 16, implicitRounds: 656000},
+	"sha512_crypt": {id: "6", saltSize: 16, implicitRounds: 656000},
+	"blowfish":     {id: "2b", saltSize: 22, saltExact: true, implicitRounds: 12, implicitIdent: "2b"},
+	"bcrypt":       {id: "2b", saltSize: 22, saltExact: true, implicitRounds: 12, implicitIdent: "2b"},
+}
+
+// filterPasswordHash ports real Ansible's password_hash filter
+// (ansible.utils.encrypt.do_encrypt/get_encrypted_password): crypt(3)/MCF
+// password hashing via github.com/go-encryptions/unixcrypt. Real Ansible
+// itself defers to whichever of libxcrypt or passlib is installed on the
+// controller; this port always uses unixcrypt's own pure-Go implementation,
+// so results are portable (byte-identical on every OS/arch) rather than
+// depending on what happens to be installed locally — a real, disclosed
+// difference in provenance, though the output format and algorithms
+// themselves are byte-for-byte the same crypt(3)/MCF standard.
+func filterPasswordHash(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+	password := in.String()
+
+	hashtype := "sha512"
+	if len(params.Args) > 0 {
+		hashtype = params.Args[0].String()
+	} else if kw, ok := params.KwArgs["hashtype"]; ok && !kw.IsNil() {
+		hashtype = kw.String()
+	}
+	algo, ok := passwordHashAlgorithms[strings.ToLower(hashtype)]
+	if !ok {
+		names := make([]string, 0, len(passwordHashAlgorithms))
+		for name := range passwordHashAlgorithms {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		return exec.ValueError(fmt.Errorf("password_hash: unsupported hashtype %q, must be one of %s", hashtype, strings.Join(names, ", ")))
+	}
+
+	saltArg, hasSalt := "", false
+	if len(params.Args) > 1 {
+		saltArg, hasSalt = params.Args[1].String(), true
+	} else if kw, ok := params.KwArgs["salt"]; ok && !kw.IsNil() {
+		saltArg, hasSalt = kw.String(), true
+	}
+	saltSize := algo.saltSize
+	if len(params.Args) > 2 {
+		saltSize = params.Args[2].Integer()
+	} else if kw, ok := params.KwArgs["salt_size"]; ok && !kw.IsNil() {
+		saltSize = kw.Integer()
+	}
+	rounds, hasRounds := 0, false
+	if len(params.Args) > 3 {
+		rounds, hasRounds = params.Args[3].Integer(), true
+	} else if kw, ok := params.KwArgs["rounds"]; ok && !kw.IsNil() {
+		rounds, hasRounds = kw.Integer(), true
+	}
+	ident := algo.implicitIdent
+	if len(params.Args) > 4 {
+		ident = params.Args[4].String()
+	} else if kw, ok := params.KwArgs["ident"]; ok && !kw.IsNil() {
+		ident = kw.String()
+	}
+
+	if algo.id == "2b" {
+		return passwordHashBcrypt(password, ident, algo, saltArg, hasSalt, rounds, hasRounds)
+	}
+
+	salt := saltArg
+	if !hasSalt {
+		s, err := unixcrypt.RandomSalt(saltSize)
+		if err != nil {
+			return exec.ValueError(fmt.Errorf("password_hash: %w", err))
+		}
+		salt = s
+	} else if v := validatePasswordHashSalt(salt, algo); v != nil {
+		return v
+	}
+
+	switch algo.id {
+	case "1":
+		return exec.AsValue(unixcrypt.MD5Crypt(password, salt))
+	case "5":
+		r := algo.implicitRounds
+		if hasRounds {
+			r = rounds
+		}
+		return exec.AsValue(unixcrypt.SHA256Crypt(password, salt, r))
+	default: // "6"
+		r := algo.implicitRounds
+		if hasRounds {
+			r = rounds
+		}
+		return exec.AsValue(unixcrypt.SHA512Crypt(password, salt, r))
+	}
+}
+
+// validatePasswordHashSalt ports CryptHash._salt's own validation (invalid
+// characters; too long for a variable-length salt; wrong length for an
+// exact-length one) — real Ansible errors on an oversized salt rather than
+// silently truncating it the way the bare crypt(3) algorithm itself would.
+func validatePasswordHashSalt(salt string, algo passwordHashAlgo) *exec.Value {
+	if !unixcrypt.ValidSaltChars(salt) {
+		return exec.ValueError(fmt.Errorf("password_hash: invalid characters in salt"))
+	}
+	if algo.saltExact && len(salt) != algo.saltSize {
+		return exec.ValueError(fmt.Errorf("password_hash: invalid salt size supplied (%d), expected %d", len(salt), algo.saltSize))
+	}
+	if !algo.saltExact && len(salt) > algo.saltSize {
+		return exec.ValueError(fmt.Errorf("password_hash: invalid salt size supplied (%d), expected at most %d", len(salt), algo.saltSize))
+	}
+	return nil
+}
+
+// passwordHashBcrypt handles the bcrypt/blowfish hashtype: its salt is 16
+// raw bytes, not a crypt(3)-charset string, and its "rounds" argument is
+// really the cost (work) factor. A fresh salt is always generated as
+// exactly 16 raw random bytes — bcrypt's own fixed algorithm requirement —
+// a disclosed simplification of real Ansible's own salt_size-overridable
+// fresh-salt generation, which has no well-defined meaning for a byte count
+// other than 16 here anyway. A caller-supplied salt is expected as
+// bcrypt's own 22-character base64-like encoding (what any existing
+// bcrypt hash's own salt field already looks like); it's reassembled into
+// an MCF string and decoded via unixcrypt.BcryptFromMCF.
+func passwordHashBcrypt(password, ident string, algo passwordHashAlgo, saltArg string, hasSalt bool, rounds int, hasRounds bool) *exec.Value {
+	cost := algo.implicitRounds
+	if hasRounds {
+		cost = rounds
+	}
+
+	if !hasSalt {
+		salt := make([]byte, 16)
+		if _, err := rand.Read(salt); err != nil {
+			return exec.ValueError(fmt.Errorf("password_hash: %w", err))
+		}
+		hashed, err := unixcrypt.Bcrypt(password, ident, cost, salt)
+		if err != nil {
+			return exec.ValueError(fmt.Errorf("password_hash: %w", err))
+		}
+		return exec.AsValue(hashed)
+	}
+
+	if v := validatePasswordHashSalt(saltArg, algo); v != nil {
+		return v
+	}
+	mcf := fmt.Sprintf("%02d$%s", cost, saltArg)
+	hashed, err := unixcrypt.BcryptFromMCF(password, ident, mcf)
+	if err != nil {
+		return exec.ValueError(fmt.Errorf("password_hash: %w", err))
+	}
+	return exec.AsValue(hashed)
 }
