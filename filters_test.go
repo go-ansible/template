@@ -4,6 +4,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -1546,5 +1547,150 @@ func TestStrftimeFilter(t *testing.T) {
 
 	if _, err := e.Eval(`'%j' | strftime(0, utc=True)`, nil); err == nil {
 		t.Fatal("strftime with %j (no Go layout equivalent): got nil error, want one")
+	}
+}
+
+// Reference values below are real `openssl passwd` output (OpenSSL 3.6.4)
+// for the sha512/sha256/md5 cases, and the canonical OpenBSD bcrypt.c
+// vectors for bcrypt — the same sources already used to validate
+// go-encryptions/unixcrypt itself.
+
+func TestPasswordHashFilter(t *testing.T) {
+	e := New()
+
+	// The DEFAULT hashtype (sha512) with no explicit rounds uses real
+	// Ansible's own implicit default of 656000 — far above crypt(3)'s own
+	// spec default of 5000 — so even this "no rounds given" case prints
+	// a rounds= prefix, confirmed against real openssl.
+	got, err := e.Eval(`'secret' | password_hash(salt='abc123')`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "$6$rounds=656000$abc123$diZ3d1OcpqciBvz3A9xUPag8FdoKzCId.Ok8txNszw9MLzlSeCHUz5PqoeKqmcCYz6py84HrbeQeEXPJEsZKi1"; got != want {
+		t.Errorf("password_hash(default) = %q, want %q", got, want)
+	}
+
+	got, err = e.Eval(`'secret' | password_hash('sha256', 'abc123')`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "$5$rounds=535000$abc123$N68SJc6Sp0v/0Dw/aWgTkOjBJ9C4V2bsUELxlFaILfD"; got != want {
+		t.Errorf("password_hash(sha256) = %q, want %q", got, want)
+	}
+
+	got, err = e.Eval(`'secret' | password_hash('md5', 'abc123')`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "$1$abc123$5IJcAgUIzNOMrV9cXyMFd1"; got != want {
+		t.Errorf("password_hash(md5) = %q, want %q", got, want)
+	}
+
+	// sha512_crypt is an accepted spelling too (passlib's own name for
+	// the same algorithm real Ansible's hashtype='sha512' maps to).
+	got, err = e.Eval(`'secret' | password_hash('sha512_crypt', 'abc123', rounds=10000)`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "$6$rounds=10000$abc123$Z5HMbHsuGm9Y/O40xGGRe46SY51vnbt/dNLda1MMNMYi6vNmSYjFcGCre8GBI36M7KlPACMuZ7IiXkKj8OZRt/"; got != want {
+		t.Errorf("password_hash(sha512_crypt, rounds=10000) = %q, want %q", got, want)
+	}
+
+	// rounds and salt_size given positionally rather than by keyword.
+	got, err = e.Eval(`'secret' | password_hash('sha512', 'abc123', 16, 10000)`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "$6$rounds=10000$abc123$Z5HMbHsuGm9Y/O40xGGRe46SY51vnbt/dNLda1MMNMYi6vNmSYjFcGCre8GBI36M7KlPACMuZ7IiXkKj8OZRt/"; got != want {
+		t.Errorf("password_hash(positional salt_size/rounds) = %q, want %q", got, want)
+	}
+
+	// salt_size affects fresh-salt generation length when no salt is given.
+	got, err = e.Eval(`'secret' | password_hash('sha512', salt_size=4)`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := got.(string)
+	parts := strings.SplitN(s, "$", 5)
+	if len(parts) < 4 || len(parts[3]) != 4 {
+		t.Errorf("password_hash(salt_size=4) = %q, want a 4-character salt field", s)
+	}
+}
+
+func TestPasswordHashBcrypt(t *testing.T) {
+	e := New()
+
+	// OpenBSD bcrypt.c's own canonical test vector, via password_hash's
+	// bcrypt path: ident overridden to "2a" to match the vector's own
+	// prefix (real Ansible's own default ident for bcrypt/blowfish is
+	// "2b", the modern prefix every current implementation uses).
+	got, err := e.Eval(`'U*U' | password_hash('bcrypt', 'CCCCCCCCCCCCCCCCCCCCC.', rounds=5, ident='2a')`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "$2a$05$CCCCCCCCCCCCCCCCCCCCC.E5YPO9kmyuRGyh0XouQYb4YMJKvyOeW"; got != want {
+		t.Errorf("password_hash(bcrypt) = %q, want %q", got, want)
+	}
+
+	// blowfish is real Ansible's own alias for bcrypt.
+	got, err = e.Eval(`'password' | password_hash('blowfish', 'cgT08pfGUo9SUIIvXrIJ1u', rounds=10)`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "$2b$10$cgT08pfGUo9SUIIvXrIJ1uSXp0VJmOIKgEC6vqGvqRddK4Z3JB28G"; got != want {
+		t.Errorf("password_hash(blowfish) = %q, want %q", got, want)
+	}
+
+	// No explicit salt: a real 16-byte-random salt, well-formed output,
+	// and two calls must not collide.
+	got1, err := e.Eval(`'secret' | password_hash('bcrypt')`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got2, err := e.Eval(`'secret' | password_hash('bcrypt')`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1, _ := got1.(string)
+	if !strings.HasPrefix(s1, "$2b$12$") || len(s1) != 60 {
+		t.Fatalf("password_hash(bcrypt, no salt) = %q, want a well-formed $2b$12$... hash of length 60", s1)
+	}
+	if got1 == got2 {
+		t.Error("two password_hash(bcrypt) calls with no salt produced the same hash — suspicious for a real random salt")
+	}
+}
+
+func TestPasswordHashFreshSalt(t *testing.T) {
+	e := New()
+	got1, err := e.Eval(`'secret' | password_hash('sha512')`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got2, err := e.Eval(`'secret' | password_hash('sha512')`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got1 == got2 {
+		t.Error("two password_hash(sha512) calls with no salt produced the same hash — suspicious for a real random salt")
+	}
+	s1, _ := got1.(string)
+	if !strings.HasPrefix(s1, "$6$rounds=656000$") {
+		t.Errorf("password_hash(sha512, no salt) = %q, want a $6$rounds=656000$... hash", s1)
+	}
+}
+
+func TestPasswordHashErrors(t *testing.T) {
+	e := New()
+	if _, err := e.Eval(`'secret' | password_hash('not-a-real-hashtype')`, nil); err == nil {
+		t.Fatal("password_hash with an unsupported hashtype: got nil error, want one")
+	}
+	if _, err := e.Eval(`'secret' | password_hash('sha512', 'bad$salt')`, nil); err == nil {
+		t.Fatal("password_hash with invalid characters in salt: got nil error, want one")
+	}
+	if _, err := e.Eval(`'secret' | password_hash('md5', 'waytoolongforasalt')`, nil); err == nil {
+		t.Fatal("password_hash(md5) with an oversized salt: got nil error, want one")
+	}
+	if _, err := e.Eval(`'secret' | password_hash('bcrypt', 'tooshort')`, nil); err == nil {
+		t.Fatal("password_hash(bcrypt) with a wrong-length salt: got nil error, want one")
 	}
 }
