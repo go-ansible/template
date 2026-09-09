@@ -42,8 +42,8 @@ func registerFilters(filters *exec.FilterSet) {
 	must("to_json", filterToJSON(false))
 	must("to_nice_json", filterToJSON(true))
 	must("from_json", filterFromJSON)
-	must("to_yaml", filterToYAML)
-	must("to_nice_yaml", filterToYAML)
+	must("to_yaml", filterToYAML(false))
+	must("to_nice_yaml", filterToYAML(true))
 	must("from_yaml", filterFromYAML)
 
 	must("regex_replace", filterRegexReplace)
@@ -127,21 +127,108 @@ func registerFilters(filters *exec.FilterSet) {
 	must("strftime", filterStrftime)
 }
 
-func filterToJSON(indent bool) exec.FilterFunction {
+// filterToJSON renders through a hand-written emitter rather than
+// encoding/json, because real Ansible hands the value to Python's own
+// json.dumps and this filter's whole job is to produce what that produces.
+// Two differences encoding/json cannot express: Python separates items
+// with ", " and keys from values with ": " (Go writes neither space), and
+// Python honours an `indent` argument that Go's Marshal knows nothing
+// about.
+//
+// One divergence remains and is structural, not a shortcut: real Ansible
+// emits a dict in its own insertion order, because Python dicts keep it.
+// A Go map does not, and the order is already gone by the time a value
+// reaches this filter — it was lost when the YAML was decoded. Keys are
+// therefore always sorted, which at least makes the output deterministic.
+// (to_nice_json is unaffected: real Ansible sorts there too.)
+func filterToJSON(nice bool) exec.FilterFunction {
 	return func(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
-		var (
-			data []byte
-			err  error
-		)
-		if indent {
-			data, err = json.MarshalIndent(in.ToGoSimpleType(false), "", "    ")
-		} else {
-			data, err = json.Marshal(in.ToGoSimpleType(false))
+		indent := 0
+		if nice {
+			indent = 4 // real to_nice_json's own default
 		}
-		if err != nil {
+		if v, ok := params.KwArgs["indent"]; ok {
+			indent = int(v.Integer())
+		}
+		var b strings.Builder
+		if err := encodeJSON(&b, in.ToGoSimpleType(false), indent, 0); err != nil {
 			return exec.ValueError(fmt.Errorf("to_json: %w", err))
 		}
-		return exec.AsValue(string(data))
+		return exec.AsValue(b.String())
+	}
+}
+
+// encodeJSON writes v the way Python's json.dumps does. indent 0 means
+// json.dumps' own compact-with-spaces default; a positive indent switches
+// to its pretty form, where the item separator loses its trailing space
+// because a newline follows it.
+func encodeJSON(b *strings.Builder, v any, indent, depth int) error {
+	pad := func(level int) {
+		if indent > 0 {
+			b.WriteByte('\n')
+			b.WriteString(strings.Repeat(" ", indent*level))
+		}
+	}
+	itemSep := ", "
+	if indent > 0 {
+		itemSep = ","
+	}
+
+	switch t := v.(type) {
+	case map[string]any:
+		if len(t) == 0 {
+			b.WriteString("{}")
+			return nil
+		}
+		keys := make([]string, 0, len(t))
+		for k := range t {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		b.WriteByte('{')
+		for i, k := range keys {
+			if i > 0 {
+				b.WriteString(itemSep)
+			}
+			pad(depth + 1)
+			if err := encodeJSON(b, k, 0, 0); err != nil {
+				return err
+			}
+			b.WriteString(": ")
+			if err := encodeJSON(b, t[k], indent, depth+1); err != nil {
+				return err
+			}
+		}
+		pad(depth)
+		b.WriteByte('}')
+		return nil
+	case []any:
+		if len(t) == 0 {
+			b.WriteString("[]")
+			return nil
+		}
+		b.WriteByte('[')
+		for i, item := range t {
+			if i > 0 {
+				b.WriteString(itemSep)
+			}
+			pad(depth + 1)
+			if err := encodeJSON(b, item, indent, depth+1); err != nil {
+				return err
+			}
+		}
+		pad(depth)
+		b.WriteByte(']')
+		return nil
+	default:
+		// Scalars go through encoding/json, which already escapes strings
+		// and formats numbers the way json.dumps does.
+		data, err := json.Marshal(t)
+		if err != nil {
+			return err
+		}
+		b.Write(data)
+		return nil
 	}
 }
 
@@ -153,12 +240,95 @@ func filterFromJSON(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *ex
 	return exec.AsValue(out)
 }
 
-func filterToYAML(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
-	data, err := yaml.Marshal(in.ToGoSimpleType(false))
-	if err != nil {
-		return exec.ValueError(fmt.Errorf("to_yaml: %w", err))
+// filterToYAML reproduces the two dumper settings real Ansible actually
+// uses, which had been collapsed into one function here:
+//
+//   - to_yaml leaves PyYAML's default_flow_style at None, so a collection
+//     whose children are all scalars comes out inline ("{a: 1, b: 2}",
+//     "items: [1, 2]") while anything nested stays block.
+//   - to_nice_yaml passes default_flow_style=False, so everything is block.
+//
+// Both keep the trailing newline the dumper emits; this port used to strip
+// it from both.
+//
+// One disclosed difference remains: yaml.v3 indents a block sequence under
+// its key, where PyYAML puts the dashes at the key's own indentation. The
+// two parse identically, and yaml.v3 offers no way to change it.
+func filterToYAML(nice bool) exec.FilterFunction {
+	return func(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
+		node, err := yamlNode(in.ToGoSimpleType(false), !nice)
+		if err != nil {
+			return exec.ValueError(fmt.Errorf("to_yaml: %w", err))
+		}
+		var b strings.Builder
+		enc := yaml.NewEncoder(&b)
+		enc.SetIndent(4)
+		if err := enc.Encode(node); err != nil {
+			return exec.ValueError(fmt.Errorf("to_yaml: %w", err))
+		}
+		if err := enc.Close(); err != nil {
+			return exec.ValueError(fmt.Errorf("to_yaml: %w", err))
+		}
+		return exec.AsValue(b.String())
 	}
-	return exec.AsValue(strings.TrimRight(string(data), "\n"))
+}
+
+// yamlNode builds the node tree to_yaml emits. When flowLeaves is set, a
+// mapping or sequence holding nothing but scalars is marked flow style —
+// PyYAML's own default_flow_style=None rule, which picks per collection
+// rather than for the document as a whole.
+func yamlNode(v any, flowLeaves bool) (*yaml.Node, error) {
+	switch t := v.(type) {
+	case map[string]any:
+		node := &yaml.Node{Kind: yaml.MappingNode}
+		keys := make([]string, 0, len(t))
+		for k := range t {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		allScalar := true
+		for _, k := range keys {
+			kn := &yaml.Node{}
+			if err := kn.Encode(k); err != nil {
+				return nil, err
+			}
+			vn, err := yamlNode(t[k], flowLeaves)
+			if err != nil {
+				return nil, err
+			}
+			if vn.Kind != yaml.ScalarNode {
+				allScalar = false
+			}
+			node.Content = append(node.Content, kn, vn)
+		}
+		if flowLeaves && allScalar && len(keys) > 0 {
+			node.Style = yaml.FlowStyle
+		}
+		return node, nil
+	case []any:
+		node := &yaml.Node{Kind: yaml.SequenceNode}
+		allScalar := true
+		for _, item := range t {
+			vn, err := yamlNode(item, flowLeaves)
+			if err != nil {
+				return nil, err
+			}
+			if vn.Kind != yaml.ScalarNode {
+				allScalar = false
+			}
+			node.Content = append(node.Content, vn)
+		}
+		if flowLeaves && allScalar && len(t) > 0 {
+			node.Style = yaml.FlowStyle
+		}
+		return node, nil
+	default:
+		node := &yaml.Node{}
+		if err := node.Encode(t); err != nil {
+			return nil, err
+		}
+		return node, nil
+	}
 }
 
 func filterFromYAML(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
@@ -291,10 +461,19 @@ func filterMandatory(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *e
 	return in
 }
 
+// filterTernary ports real Ansible's own ternary(value, true_val,
+// false_val, none_val=None): a THIRD argument, taken when the input is
+// None, and only when it was actually supplied — real Ansible's own check
+// is `if value is None and none_val is not None`, so an explicit
+// none_val=None still falls through to the ordinary truthiness branch.
 func filterTernary(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
-	p := params.Expect(2, nil)
+	p := params.Expect(2, []*exec.KwArg{{Name: "none_val", Default: nil}})
 	if p.IsError() {
 		return exec.ValueError(fmt.Errorf("%s", p.Error()))
+	}
+	noneVal := p.GetKeywordArgument("none_val", exec.AsValue(nil))
+	if in.IsNil() && !noneVal.IsNil() {
+		return noneVal
 	}
 	if in.IsTrue() {
 		return p.Args[0]
@@ -372,8 +551,36 @@ func filterItems2Dict(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *
 	return exec.AsValue(out)
 }
 
+// filterTypeDebug reports the PYTHON type name, which is what real
+// Ansible's own `type(o).__name__` produces and what a playbook actually
+// compares against (`when: x | type_debug == 'dict'`). Reporting Go's own
+// type names instead — "string", "[]interface {}", "map[string]interface {}"
+// — would make every such comparison silently false.
 func filterTypeDebug(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
-	return exec.AsValue(fmt.Sprintf("%T", in.ToGoSimpleType(false)))
+	return exec.AsValue(pythonTypeName(in.ToGoSimpleType(false)))
+}
+
+func pythonTypeName(v any) string {
+	switch t := v.(type) {
+	case nil:
+		return "NoneType"
+	case bool:
+		return "bool"
+	case string:
+		return "str"
+	case float32, float64:
+		return "float"
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return "int"
+	case []any:
+		return "list"
+	case map[string]any:
+		return "dict"
+	default:
+		// Anything this port introduces that Python has no name for is
+		// reported by its Go type rather than guessed at.
+		return fmt.Sprintf("%T", t)
+	}
 }
 
 func filterQuote(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
@@ -558,10 +765,21 @@ func filterPow(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Va
 func filterRoot(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *exec.Value {
 	base := floatArg(params, 0, "base", 2)
 	x := in.Float()
-	if base == 2 {
+	switch base {
+	case 2:
 		return exec.AsValue(math.Sqrt(x))
+	case 3:
+		// Not a special case for its own sake: Go's math.Pow is a pure-Go
+		// implementation and is a whole ULP away from the C pow() that
+		// Python's math.pow calls, so `27 | root(3)` gives
+		// 2.9999999999999996 here against real Ansible's 3.0 — measured,
+		// not assumed. math.Cbrt is the correctly-rounded primitive for
+		// this exponent and agrees with real Ansible. Bases above 3 have
+		// no such primitive in Go and can still differ in the last place.
+		return exec.AsValue(math.Cbrt(x))
+	default:
+		return exec.AsValue(math.Pow(x, 1.0/base))
 	}
-	return exec.AsValue(math.Pow(x, 1.0/base))
 }
 
 // sizeRanges mirrors real Ansible's own SIZE_RANGES table

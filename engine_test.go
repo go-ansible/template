@@ -147,7 +147,7 @@ func TestAnsibleFilters(t *testing.T) {
 		vars map[string]any
 		want string
 	}{
-		{"to_json", `{{ d | to_json }}`, map[string]any{"d": map[string]any{"a": 1}}, `{"a":1}`},
+		{"to_json", `{{ d | to_json }}`, map[string]any{"d": map[string]any{"a": 1}}, `{"a": 1}`},
 		{"regex_replace", `{{ 'hello world' | regex_replace('world', 'there') }}`, nil, "hello there"},
 		{"regex_replace backref", `{{ 'foo123' | regex_replace('foo(\\d+)', 'bar\\1') }}`, nil, "bar123"},
 		{"basename", `{{ '/a/b/c.txt' | basename }}`, nil, "c.txt"},
