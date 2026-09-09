@@ -15,7 +15,9 @@ func TestJSONFilters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != `{"a":1}` {
+	// Real ansible-core 2.21.4 renders this as {"a": 1} -- Python's
+	// json.dumps separates with ", " and ": ".
+	if got != `{"a": 1}` {
 		t.Fatalf("to_json = %q", got)
 	}
 
@@ -62,13 +64,21 @@ func TestYAMLFilters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "a: 1" {
-		t.Fatalf("to_yaml = %q, want %q", got, "a: 1")
+	// Real ansible-core 2.21.4: an all-scalar mapping comes out inline
+	// under PyYAML's default_flow_style=None, and the dumper's trailing
+	// newline is kept.
+	if got != "{a: 1}\n" {
+		t.Fatalf("to_yaml = %q, want %q", got, "{a: 1}\n")
 	}
 
-	// to_nice_yaml is registered as the same filter as to_yaml.
-	if _, err := e.Render(`{{ d | to_nice_yaml }}`, map[string]any{"d": map[string]any{"a": 1}}); err != nil {
+	// to_nice_yaml passes default_flow_style=False instead, so the same
+	// mapping stays block.
+	got, err = e.Render(`{{ d | to_nice_yaml }}`, map[string]any{"d": map[string]any{"a": 1}})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if got != "a: 1\n" {
+		t.Fatalf("to_nice_yaml = %q, want %q", got, "a: 1\n")
 	}
 
 	gotVal, err := e.RenderValue(`{{ s | from_yaml }}`, map[string]any{"s": "a: 1\nb:\n  - 1\n  - 2\n"})
