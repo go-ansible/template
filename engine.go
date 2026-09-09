@@ -22,9 +22,16 @@ import (
 
 // Engine renders Ansible-flavored Jinja2 templates and expressions.
 type Engine struct {
-	cfg    *config.Config
-	env    *exec.Environment
-	loader loaders.Loader
+	// OnWarning, when set, receives warnings a render would otherwise
+	// have nowhere to go — currently only a lookup called with
+	// errors=warn, which real Ansible reports through its own Display
+	// layer. Left nil, such a lookup degrades to errors=ignore.
+	OnWarning func(msg string)
+
+	cfg     *config.Config
+	env     *exec.Environment
+	loader  loaders.Loader
+	lookups map[string]lookupFunc
 }
 
 // New returns an Engine with Jinja2's built-in filters/tests plus
@@ -52,10 +59,14 @@ func New() *Engine {
 		Methods:           builtins.Methods,
 	}
 
+	lookups := map[string]lookupFunc{}
+	registerLookups(lookups)
+
 	return &Engine{
-		cfg:    cfg,
-		env:    env,
-		loader: loaders.MustNewMemoryLoader(map[string]string{}),
+		cfg:     cfg,
+		env:     env,
+		loader:  loaders.MustNewMemoryLoader(map[string]string{}),
+		lookups: lookups,
 	}
 }
 
@@ -87,7 +98,7 @@ func (e *Engine) Render(src string, data map[string]any) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("template: parsing: %w", err)
 	}
-	out, err := tpl.ExecuteToString(exec.NewContext(data))
+	out, err := tpl.ExecuteToString(e.callContext(data))
 	if err != nil {
 		return "", fmt.Errorf("template: rendering: %w", err)
 	}
@@ -130,7 +141,7 @@ func (e *Engine) evalValue(exprSrc string, data map[string]any) (*exec.Value, er
 	if !ok {
 		return nil, fmt.Errorf("template: parsing expression %q: unexpected node type %T", exprSrc, node)
 	}
-	ctx := e.env.Context.Inherit().Update(exec.NewContext(data))
+	ctx := e.env.Context.Inherit().Update(e.callContext(data))
 	evaluator := &exec.Evaluator{
 		Config: e.cfg,
 		Environment: &exec.Environment{
