@@ -158,6 +158,24 @@ func filterToJSON(nice bool) exec.FilterFunction {
 	}
 }
 
+// ToJSON renders v the way Python's json.dumps does, which is what real
+// Ansible's own output looks like wherever it prints a result as JSON —
+// the to_json filter here, and the failure lines go-ansible/playbook's
+// default callback writes. Exported so that second caller renders
+// identically rather than growing its own emitter that can drift.
+//
+// indent 0 gives json.dumps' compact-with-spaces default (", " and
+// ": "); a positive indent gives its pretty form. Keys are always
+// sorted — see filterToJSON for why insertion order is not recoverable
+// here.
+func ToJSON(v any, indent int) (string, error) {
+	var b strings.Builder
+	if err := encodeJSON(&b, v, indent, 0); err != nil {
+		return "", err
+	}
+	return b.String(), nil
+}
+
 // encodeJSON writes v the way Python's json.dumps does. indent 0 means
 // json.dumps' own compact-with-spaces default; a positive indent switches
 // to its pretty form, where the item separator loses its trailing space
