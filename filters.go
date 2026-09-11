@@ -1,6 +1,7 @@
 package template
 
 import (
+	"bytes"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha1"
@@ -158,6 +159,19 @@ func filterToJSON(nice bool) exec.FilterFunction {
 	}
 }
 
+// marshalScalar encodes one scalar the way json.dumps would, without
+// encoding/json's HTML escaping. Encoder.Encode appends a newline, which
+// is trimmed back off.
+func marshalScalar(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
 // ToJSON renders v the way Python's json.dumps does, which is what real
 // Ansible's own output looks like wherever it prints a result as JSON —
 // the to_json filter here, and the failure lines go-ansible/playbook's
@@ -239,9 +253,13 @@ func encodeJSON(b *strings.Builder, v any, indent, depth int) error {
 		b.WriteByte(']')
 		return nil
 	default:
-		// Scalars go through encoding/json, which already escapes strings
-		// and formats numbers the way json.dumps does.
-		data, err := json.Marshal(t)
+		// Scalars go through encoding/json for string escaping and number
+		// formatting — but with HTML escaping OFF. Go's default turns
+		// <, > and & into \u003c, \u003e and \u0026, which Python's
+		// json.dumps does not, so a URL, a shell redirect or a snippet of
+		// markup came out mangled. Measured against real ansible-core:
+		// `'a > b & c < d' | to_json` is "a > b & c < d" there.
+		data, err := marshalScalar(t)
 		if err != nil {
 			return err
 		}
