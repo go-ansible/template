@@ -80,3 +80,27 @@ func TestConformanceAgainstRealAnsible(t *testing.T) {
 		})
 	}
 }
+
+// TestToJSONExported covers the emitter now shared with
+// go-ansible/playbook's default callback, so a failure line there reads
+// the way real Ansible's does rather than in Go's own compact spelling.
+func TestToJSONExported(t *testing.T) {
+	v := map[string]any{"b": 2, "a": 1, "l": []any{1, "x"}}
+
+	got, err := ToJSON(v, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Python's json.dumps default: ", " between items, ": " after a key.
+	if want := `{"a": 1, "b": 2, "l": [1, "x"]}`; got != want {
+		t.Errorf("ToJSON(v, 0) = %q, want %q", got, want)
+	}
+
+	got, err = ToJSON(map[string]any{"a": 1}, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "{\n    \"a\": 1\n}"; got != want {
+		t.Errorf("ToJSON(v, 4) = %q, want %q", got, want)
+	}
+}
