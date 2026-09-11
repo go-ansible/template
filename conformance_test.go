@@ -47,6 +47,13 @@ func TestConformanceAgainstRealAnsible(t *testing.T) {
 		{"to_json indent", `{{ d | to_json(indent=2) }}`,
 			map[string]any{"d": map[string]any{"a": 1}}, "{\n  \"a\": 1\n}"},
 		{"to_json empty dict", `{{ {} | to_json }}`, nil, `{}`},
+		// Go's encoding/json escapes <, > and & by default; Python's
+		// json.dumps does not, so a URL, a shell redirect or a snippet of
+		// markup used to come out mangled as \u003e and friends.
+		{"to_json leaves angle brackets and ampersands alone",
+			`{{ s | to_json }}`, map[string]any{"s": "a > b & c < d"}, `"a > b & c < d"`},
+		{"to_json in a structure", `{{ d | to_json }}`,
+			map[string]any{"d": map[string]any{"url": "x?a=1&b=2"}}, `{"url": "x?a=1&b=2"}`},
 		{"to_json empty list", `{{ [] | to_json }}`, nil, `[]`},
 		{"to_nice_json", `{{ d | to_nice_json }}`,
 			map[string]any{"d": map[string]any{"a": 1}}, "{\n    \"a\": 1\n}"},
