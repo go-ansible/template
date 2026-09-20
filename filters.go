@@ -253,6 +253,38 @@ func encodeJSON(b *strings.Builder, v any, indent, depth int) error {
 		b.WriteByte(']')
 		return nil
 	default:
+		// A TYPED collection — []string, map[string]string, and so on —
+		// must be encoded like its any-typed equivalent rather than
+		// handed to encoding/json, whose compact output omits the space
+		// after each comma that Python's json.dumps writes. Measured:
+		// a command module's `cmd` is a []string, and real ansible-core
+		// prints ["sh", "-c", "exit 1"] where this printed
+		// ["sh","-c","exit 1"].
+		//
+		// []byte is deliberately excluded: encoding/json renders it as
+		// a base64 string, and turning it into an array of numbers here
+		// would be a different value, not a differently-spaced one.
+		if rv := reflect.ValueOf(v); rv.IsValid() {
+			switch rv.Kind() {
+			case reflect.Slice, reflect.Array:
+				if rv.Type().Elem().Kind() != reflect.Uint8 {
+					items := make([]any, rv.Len())
+					for i := range items {
+						items[i] = rv.Index(i).Interface()
+					}
+					return encodeJSON(b, items, indent, depth)
+				}
+			case reflect.Map:
+				if rv.Type().Key().Kind() == reflect.String {
+					m := make(map[string]any, rv.Len())
+					for _, k := range rv.MapKeys() {
+						m[k.String()] = rv.MapIndex(k).Interface()
+					}
+					return encodeJSON(b, m, indent, depth)
+				}
+			}
+		}
+
 		// Scalars go through encoding/json for string escaping and number
 		// formatting — but with HTML escaping OFF. Go's default turns
 		// <, > and & into \u003c, \u003e and \u0026, which Python's
