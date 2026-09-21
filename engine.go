@@ -32,10 +32,33 @@ type Engine struct {
 	env     *exec.Environment
 	loader  loaders.Loader
 	lookups map[string]lookupFunc
+
+	// jinjaEscapes selects plain Jinja2 string-literal semantics over
+	// Ansible's raw ones — see JinjaStringEscapes.
+	jinjaEscapes bool
 }
 
 // New returns an Engine with Jinja2's built-in filters/tests plus
 // Ansible's filter and test library.
+// JinjaStringEscapes switches this engine from Ansible's RAW string
+// literals to plain Jinja2's escape processing, where "x\ny" is three
+// characters and 'C:\Users' is an error.
+//
+// Real ansible-core 2.21 uses BOTH, depending on where the expression
+// was written — measured with one expression in two places:
+//
+//	{{ "x\ny" | length }}   inline in a playbook   4   (raw)
+//	{{ "x\ny" | length }}   inside a .j2 file      3   (Jinja2)
+//
+// So an engine rendering a template FILE for the `template` module sets
+// this, and one evaluating a playbook's own expressions does not. It is
+// off by default because the playbook engine is the larger caller and
+// its semantics are the ones a task author meets first.
+func (e *Engine) JinjaStringEscapes() *Engine {
+	e.jinjaEscapes = true
+	return e
+}
+
 func New() *Engine {
 	cfg := config.New()
 	cfg.KeepTrailingNewline = true
@@ -99,9 +122,14 @@ func wholeExpression(s string) (expr string, ok bool) {
 // to its string form.
 func (e *Engine) Render(src string, data map[string]any) (string, error) {
 	// String literals containing a backslash are lifted out before
-	// gonja sees them — see liftRawStringLiterals for why.
-	src, rawConsts := liftRawStringLiterals(src)
-	data = withRawLiterals(data, rawConsts)
+	// gonja sees them — see liftRawStringLiterals for why. An engine
+	// rendering a template FILE skips that: real Ansible uses plain
+	// Jinja2 semantics there.
+	if !e.jinjaEscapes {
+		var rawConsts map[string]any
+		src, rawConsts = liftRawStringLiterals(src)
+		data = withRawLiterals(data, rawConsts)
+	}
 
 	tpl, err := exec.NewTemplate("/template", e.cfg, loaders.MustNewMemoryLoader(map[string]string{"/template": src}), e.env)
 	if err != nil {
@@ -142,8 +170,12 @@ func (e *Engine) evalValue(exprSrc string, data map[string]any) (*exec.Value, er
 	// ParseExpressionNode, which consumes the {{ / }} delimiters for us.
 	// As in Render: a literal with a backslash is lifted to a variable
 	// so gonja never parses it as an escape.
-	lifted, rawConsts := liftRawStringLiterals("{{ " + exprSrc + " }}")
-	data = withRawLiterals(data, rawConsts)
+	lifted := "{{ " + exprSrc + " }}"
+	if !e.jinjaEscapes {
+		var rawConsts map[string]any
+		lifted, rawConsts = liftRawStringLiterals(lifted)
+		data = withRawLiterals(data, rawConsts)
+	}
 
 	stream := tokens.Lex(lifted, e.cfg)
 	p := parser.NewParser("<expr>", stream, e.cfg, e.loader, e.env.ControlStructures)
