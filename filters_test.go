@@ -133,7 +133,7 @@ func TestRegexReplaceFilter(t *testing.T) {
 
 func TestRegexSearchFilter(t *testing.T) {
 	e := New()
-	got, err := e.Eval(`'hello world' | regex_search('w\\w+')`, nil)
+	got, err := e.Eval(`'hello world' | regex_search('w\w+')`, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +159,7 @@ func TestRegexSearchFilter(t *testing.T) {
 
 func TestRegexFindallFilter(t *testing.T) {
 	e := New()
-	got, err := e.Eval(`'a1 b2 c3' | regex_findall('\\d')`, nil)
+	got, err := e.Eval(`'a1 b2 c3' | regex_findall('\d')`, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -968,7 +968,7 @@ func TestWinPathFilters(t *testing.T) {
 		t.Errorf("win_basename = %q, want %q", got, "bar")
 	}
 
-	got, err = e.Render(`{{ 'C:\\foo\\bar' | win_dirname }}`, nil)
+	got, err = e.Render(`{{ 'C:\foo\bar' | win_dirname }}`, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -976,7 +976,7 @@ func TestWinPathFilters(t *testing.T) {
 		t.Errorf("win_dirname = %q, want %q", got, `C:\foo`)
 	}
 
-	gotVal, err := e.RenderValue(`{{ 'C:\\foo\\bar' | win_splitdrive }}`, nil)
+	gotVal, err := e.RenderValue(`{{ 'C:\foo\bar' | win_splitdrive }}`, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -985,7 +985,7 @@ func TestWinPathFilters(t *testing.T) {
 		t.Errorf("win_splitdrive = %#v, want (%q, %q)", list, "C:", `\foo\bar`)
 	}
 
-	gotVal, err = e.RenderValue(`{{ '\\\\server\\share\\a\\b' | win_splitdrive }}`, nil)
+	gotVal, err = e.RenderValue(`{{ '\\server\share\a\b' | win_splitdrive }}`, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -994,7 +994,7 @@ func TestWinPathFilters(t *testing.T) {
 		t.Errorf(`win_splitdrive(UNC) = %#v, want (%q, %q)`, list, `\\server\share`, `\a\b`)
 	}
 
-	gotVal, err = e.RenderValue(`{{ 'relative\\path' | win_splitdrive }}`, nil)
+	gotVal, err = e.RenderValue(`{{ 'relative\path' | win_splitdrive }}`, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1005,7 +1005,7 @@ func TestWinPathFilters(t *testing.T) {
 
 	// A rooted-relative path (no drive) and two malformed/incomplete UNC
 	// forms (missing the share separator entirely).
-	gotVal, err = e.RenderValue(`{{ '\\Windows' | win_splitdrive }}`, nil)
+	gotVal, err = e.RenderValue(`{{ '\Windows' | win_splitdrive }}`, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1014,7 +1014,7 @@ func TestWinPathFilters(t *testing.T) {
 		t.Errorf("win_splitdrive(rooted, no drive) = %#v, want (%q, %q)", list, "", `\Windows`)
 	}
 
-	gotVal, err = e.RenderValue(`{{ '\\\\server' | win_splitdrive }}`, nil)
+	gotVal, err = e.RenderValue(`{{ '\\server' | win_splitdrive }}`, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1023,7 +1023,7 @@ func TestWinPathFilters(t *testing.T) {
 		t.Errorf("win_splitdrive(UNC, no share separator) = %#v, want (%q, %q)", list, `\\server`, "")
 	}
 
-	gotVal, err = e.RenderValue(`{{ '\\\\server\\share' | win_splitdrive }}`, nil)
+	gotVal, err = e.RenderValue(`{{ '\\server\share' | win_splitdrive }}`, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
