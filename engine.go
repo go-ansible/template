@@ -94,6 +94,11 @@ func wholeExpression(s string) (expr string, ok bool) {
 // Render renders a full template string (text mixed with {{ }} / {% %})
 // to its string form.
 func (e *Engine) Render(src string, data map[string]any) (string, error) {
+	// String literals containing a backslash are lifted out before
+	// gonja sees them — see liftRawStringLiterals for why.
+	src, rawConsts := liftRawStringLiterals(src)
+	data = withRawLiterals(data, rawConsts)
+
 	tpl, err := exec.NewTemplate("/template", e.cfg, loaders.MustNewMemoryLoader(map[string]string{"/template": src}), e.env)
 	if err != nil {
 		return "", fmt.Errorf("template: parsing: %w", err)
@@ -131,7 +136,12 @@ func (e *Engine) evalValue(exprSrc string, data map[string]any) (*exec.Value, er
 	// VariableBegin token (the state Parse() is in while walking a real
 	// {{ }} block) — wrap the source the same way and use the exported
 	// ParseExpressionNode, which consumes the {{ / }} delimiters for us.
-	stream := tokens.Lex("{{ "+exprSrc+" }}", e.cfg)
+	// As in Render: a literal with a backslash is lifted to a variable
+	// so gonja never parses it as an escape.
+	lifted, rawConsts := liftRawStringLiterals("{{ " + exprSrc + " }}")
+	data = withRawLiterals(data, rawConsts)
+
+	stream := tokens.Lex(lifted, e.cfg)
 	p := parser.NewParser("<expr>", stream, e.cfg, e.loader, e.env.ControlStructures)
 	node, err := p.ParseExpressionNode()
 	if err != nil {
