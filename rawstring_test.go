@@ -161,3 +161,56 @@ func TestWholeExpressionSkipsLiterals(t *testing.T) {
 		})
 	}
 }
+
+// TestTwoStringLiteralModes pins the fact that real ansible-core 2.21
+// uses BOTH semantics, depending on where the expression was written.
+// One expression, two places, two answers — measured:
+//
+//	{{ "x\ny" | length }}   inline in a playbook   4
+//	{{ "x\ny" | length }}   inside a .j2 file      3
+//
+// So this is not a question of which is "right": the port needs both,
+// and picks by caller.
+func TestTwoStringLiteralModes(t *testing.T) {
+	tests := []struct {
+		expr      string
+		inline    any // Ansible's raw literals
+		inAFile   any // plain Jinja2's escapes
+		fileFails bool
+	}{
+		{expr: `"x\ny" | length`, inline: 4, inAFile: 3},
+		{expr: `"x\ty" | length`, inline: 4, inAFile: 3},
+		// A Windows path parses raw and is an error under Jinja2, which
+		// is what real Ansible reports for a .j2 containing one.
+		{expr: `"C:\Users"`, inline: `C:\Users`, fileFails: true},
+		// Without a backslash the two agree, which is the common case.
+		{expr: `"plain" | length`, inline: 5, inAFile: 5},
+		{expr: `"a.b" | regex_replace("x", "-")`, inline: "a.b", inAFile: "a.b"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.expr, func(t *testing.T) {
+			got, err := New().Eval(tt.expr, nil)
+			if err != nil {
+				t.Fatalf("inline: %v", err)
+			}
+			if got != tt.inline {
+				t.Errorf("inline = %#v, real ansible-core gives %#v", got, tt.inline)
+			}
+
+			got, err = New().JinjaStringEscapes().Eval(tt.expr, nil)
+			if tt.fileFails {
+				if err == nil {
+					t.Errorf("in a file this must fail as Jinja2 does, got %#v", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("in a file: %v", err)
+			}
+			if got != tt.inAFile {
+				t.Errorf("in a file = %#v, real Jinja2 gives %#v", got, tt.inAFile)
+			}
+		})
+	}
+}
