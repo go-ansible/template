@@ -17,6 +17,12 @@ func ansibleBin(t *testing.T) string {
 	}
 	p, err := exec.LookPath("ansible")
 	if err != nil {
+		// A skipped judge reads exactly like a passing one, and this one is
+		// THE judge: a drop-in port is only drop-in against the thing it
+		// replaces. The lane that installs ansible-core sets this.
+		if os.Getenv("ANSIBLE_REQUIRE") != "" {
+			t.Fatalf("ANSIBLE_REQUIRE is set but ansible is not installed: %v", err)
+		}
 		t.Skip("ansible not found in PATH; skipping cross-validation against the reference implementation")
 	}
 	return p
