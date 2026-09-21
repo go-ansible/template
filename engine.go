@@ -85,7 +85,11 @@ func wholeExpression(s string) (expr string, ok bool) {
 		return "", false
 	}
 	inner := t[2 : len(t)-2]
-	if strings.Contains(inner, "}}") {
+	// A "}}" INSIDE a string literal does not start a second block, so
+	// the search skips literals. Without that, `{{ "a}}b" | length }}`
+	// was not recognised as a whole expression and came back as the
+	// string "5" where real ansible-core gives the number 5.
+	if indexOutsideLiteral(inner, "}}") >= 0 {
 		return "", false // more than one block
 	}
 	return strings.TrimSpace(inner), true

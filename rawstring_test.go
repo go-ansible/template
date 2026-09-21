@@ -130,3 +130,34 @@ func contains(s, sub string) bool {
 		return false
 	})()
 }
+
+// A "}}" inside a string literal does not end the block, so an
+// expression containing one is still a whole expression and keeps its
+// native type. Real ansible-core answers 5, not "5".
+func TestWholeExpressionSkipsLiterals(t *testing.T) {
+	e := New()
+	tests := []struct {
+		src  string
+		want any
+	}{
+		{`{{ "a\}}b" | length }}`, 5},
+		{`{{ "a}}b" | length }}`, 4},
+		{`{{ "}}" }}`, "}}"},
+		{`{{ 1 + 1 }}`, 2},
+		// Two real blocks are still not a whole expression: the result
+		// is the rendered string.
+		{`{{ 1 }}{{ 2 }}`, "12"},
+		{`x {{ 1 }}`, "x 1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.src, func(t *testing.T) {
+			got, err := e.RenderValue(tt.src, nil)
+			if err != nil {
+				t.Fatalf("RenderValue(%s): %v", tt.src, err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("RenderValue(%s) = %#v, real ansible-core gives %#v", tt.src, got, tt.want)
+			}
+		})
+	}
+}
