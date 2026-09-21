@@ -2364,3 +2364,12 @@ func passwordHashBcrypt(password, ident string, algo passwordHashAlgo, saltArg s
 	}
 	return exec.AsValue(hashed)
 }
+
+// PythonTypeName is the name Python would give this value's type —
+// 'str', 'int', 'list', 'dict', 'NoneType' and so on. It is what the
+// type_debug filter reports, exported because a caller that has to
+// explain a value to a user in Ansible's own words needs the same
+// name: the playbook engine's "Conditional result was derived from
+// value of type 'str'" is real Ansible's wording, and forming that
+// name a second time is how two answers drift apart.
+func PythonTypeName(v any) string { return pythonTypeName(v) }
