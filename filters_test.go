@@ -1704,3 +1704,51 @@ func TestPasswordHashErrors(t *testing.T) {
 		t.Fatal("password_hash(bcrypt) with a wrong-length salt: got nil error, want one")
 	}
 }
+
+// TestPythonFloatRepr pins float formatting against values produced by
+// the REFERENCE interpreter (ansible's own venv python), not by
+// reading Python's docs. The whole-valued case is the one that
+// diverged: json.dumps(5.0) is "5.0" and Go's shortest form is "5", so
+// every printed result carrying a whole float was wrong.
+func TestPythonFloatRepr(t *testing.T) {
+	for _, tc := range []struct {
+		in   float64
+		want string
+	}{
+		{5.0, "5.0"},
+		{100.0, "100.0"},
+		{2.5, "2.5"},
+		{0.1, "0.1"},
+		{math.Copysign(0, -1), "-0.0"}, // a Go -0.0 literal is just 0
+		{1e16, "1e+16"},
+		{1e30, "1e+30"},
+		{1e-7, "1e-07"},
+		{1e-4, "0.0001"},
+		{1e-5, "1e-05"},
+		{1e15, "1000000000000000.0"},
+		{12345678901234567.0, "1.2345678901234568e+16"},
+		{123456789012345.0, "123456789012345.0"},
+		{1.0 / 3.0, "0.3333333333333333"},
+		{9007199254740992.0, "9007199254740992.0"},
+	} {
+		if got := pythonFloat(tc.in); got != tc.want {
+			t.Errorf("pythonFloat(%v) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestToJSONFloats: the formatting has to reach ToJSON, which is what
+// every printed result goes through — nested, in a list, and bare.
+func TestToJSONFloats(t *testing.T) {
+	got, err := ToJSON(map[string]any{
+		"whole": 5.0, "frac": 2.5, "int": 5,
+		"list": []any{1.0, 2.5},
+	}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"frac": 2.5, "int": 5, "list": [1.0, 2.5], "whole": 5.0}`
+	if got != want {
+		t.Errorf("ToJSON =\n%s\nwant\n%s", got, want)
+	}
+}

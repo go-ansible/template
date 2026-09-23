@@ -190,6 +190,62 @@ func ToJSON(v any, indent int) (string, error) {
 	return b.String(), nil
 }
 
+// pythonFloat formats a float the way Python's repr — and so
+// json.dumps — does. The difference that matters is the whole-valued
+// case: Python writes 5.0 where Go's shortest form writes 5, so a
+// dumped result carrying a whole float (a delay:, a pause:, a
+// computed average, a 5.0 straight out of a vars: block) diverged
+// from real ansible-core everywhere a result is printed as JSON.
+//
+// Both agree on the rest, checked against the reference interpreter
+// rather than assumed: 2.5, 0.1, -0.0, 1e+16, 1e-07, 1e+30 and
+// 0.3333333333333333 all come out the same from both, because both
+// use a shortest-round-trip algorithm. Only the ".0" and the
+// two-digit exponent are Python's own.
+func pythonFloat(f float64) string {
+	switch {
+	case math.IsInf(f, 1):
+		return "Infinity"
+	case math.IsInf(f, -1):
+		return "-Infinity"
+	case math.IsNaN(f):
+		return "NaN"
+	}
+	// Python chooses fixed or exponential notation on the DECIMAL
+	// EXPONENT: fixed for -4 <= exp < 16, exponential outside it
+	// (repr(1e15) is "1000000000000000.0", repr(1e16) is "1e+16";
+	// repr(1e-4) is "0.0001", repr(1e-5) is "1e-05"). Both bounds were
+	// read off the reference interpreter.
+	//
+	// Go's 'g' cannot be used for this: with shortest formatting it
+	// switches to exponential at exp >= 6, so 123456789012345.0 came
+	// out as 1.23456789012345e+14 where Python writes it in full.
+	shortest := strconv.FormatFloat(f, 'e', -1, 64)
+	i := strings.IndexByte(shortest, 'e')
+	exp, err := strconv.Atoi(shortest[i+1:])
+	if err == nil && exp >= -4 && exp < 16 {
+		out := strconv.FormatFloat(f, 'f', -1, 64)
+		if !strings.Contains(out, ".") {
+			// The whole-valued case, and the whole point: Python
+			// writes 5.0 where Go's shortest form writes 5.
+			out += ".0"
+		}
+		return out
+	}
+	// Exponential form. Python pads the exponent to two digits and
+	// leaves the mantissa bare — "1e+16", not "1.0e+16" — which is
+	// what Go's 'e' shortest form already produces.
+	mant, e := shortest[:i], shortest[i+1:]
+	sign := "+"
+	if e[0] == '+' || e[0] == '-' {
+		sign, e = string(e[0]), e[1:]
+	}
+	for len(e) < 2 {
+		e = "0" + e
+	}
+	return mant + "e" + sign + e
+}
+
 // encodeJSON writes v the way Python's json.dumps does. indent 0 means
 // json.dumps' own compact-with-spaces default; a positive indent switches
 // to its pretty form, where the item separator loses its trailing space
@@ -252,6 +308,10 @@ func encodeJSON(b *strings.Builder, v any, indent, depth int) error {
 		pad(depth)
 		b.WriteByte(']')
 		return nil
+	case float32, float64:
+		b.WriteString(pythonFloat(reflect.ValueOf(t).Float()))
+		return nil
+
 	default:
 		// A TYPED collection — []string, map[string]string, and so on —
 		// must be encoded like its any-typed equivalent rather than
