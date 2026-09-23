@@ -469,3 +469,66 @@ func TestNoneIsALiteralNotAnUndefinedName(t *testing.T) {
 		}
 	}
 }
+
+// TestEvalInlineConditional: gonja represents `A if C else B` as an
+// Output node with three separate fields, and evalValue read only the
+// first — so every inline conditional in a whole-expression position
+// returned its FIRST operand whatever the condition said.
+//
+// That is the path a MODULE ARGUMENT takes (the value's type has to
+// survive, so the text is evaluated rather than rendered), which is
+// why `mode: "{{ '0600' if secure else '0644' }}"` was always 0600
+// while the same text RENDERED was correct.
+func TestEvalInlineConditional(t *testing.T) {
+	e := New()
+	data := map[string]any{"x": "a", "y": "YY", "n": 2}
+	for _, tc := range []struct {
+		expr string
+		want any
+	}{
+		{`'A' if false else 'B'`, "B"},
+		{`'A' if true else 'B'`, "A"},
+		{`'A' if 1 == 2 else 'B'`, "B"},
+		{`1 if false else 2`, 2},
+		{`x if false else y`, "YY"},
+		{`'hit' if x == 'b' else 'miss'`, "miss"},
+		{`'eq' if n == 2 else 'ne'`, "eq"},
+		// No else and a false condition yields nothing, as the
+		// renderer does for that case.
+		{`'A' if false`, nil},
+		{`'A' if true`, "A"},
+	} {
+		got, err := e.Eval(tc.expr, data)
+		if err != nil {
+			t.Errorf("Eval(%s): %v", tc.expr, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("Eval(%-32s) = %#v, want %#v", tc.expr, got, tc.want)
+		}
+	}
+}
+
+// TestEvalAndRenderAgreeOnConditionals — the two paths disagreeing is
+// what made this survive: one of them was always right.
+func TestEvalAndRenderAgreeOnConditionals(t *testing.T) {
+	e := New()
+	data := map[string]any{"x": "a"}
+	for _, expr := range []string{
+		`'A' if false else 'B'`,
+		`'hit' if x == 'b' else 'miss'`,
+		`'hit' if x == 'a' else 'miss'`,
+	} {
+		evaled, err := e.Eval(expr, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rendered, err := e.Render("{{ "+expr+" }}", data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if evaled != rendered {
+			t.Errorf("%s: Eval = %#v but Render = %q", expr, evaled, rendered)
+		}
+	}
+}
