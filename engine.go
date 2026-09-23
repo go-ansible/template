@@ -180,6 +180,41 @@ func (e *Engine) EvalBool(exprSrc string, data map[string]any) (bool, error) {
 	return val.IsTrue(), nil
 }
 
+// evalOutput evaluates a parsed {{ ... }} the way gonja's own RENDERER
+// does, inline conditional included.
+//
+// gonja represents `A if C else B` as an Output node carrying three
+// separate fields — Expression, Condition and Alternative — and this
+// evaluated only the first. So every inline conditional in a
+// whole-expression position silently returned its FIRST operand
+// whatever the condition said:
+//
+//	mode: "{{ '0600' if secure else '0644' }}"   always 0600
+//	dest: "{{ a if use_a else b }}"              always a
+//
+// Rendering the same text was correct, which is what hid it: the bug
+// lived only on the path a MODULE ARGUMENT takes, where the value's
+// type has to survive and so a template is not rendered but evaluated.
+//
+// A condition with no else and a false result yields nil, matching the
+// renderer's own "return nothing" for that case.
+func evalOutput(evaluator *exec.Evaluator, output *nodes.Output) *exec.Value {
+	if output.Condition == nil {
+		return evaluator.Eval(output.Expression)
+	}
+	condition := evaluator.Eval(output.Condition)
+	if condition.IsError() {
+		return condition
+	}
+	if !condition.IsNil() && condition.IsTrue() {
+		return evaluator.Eval(output.Expression)
+	}
+	if output.Alternative == nil {
+		return exec.AsValue(nil)
+	}
+	return evaluator.Eval(output.Alternative)
+}
+
 func (e *Engine) evalValue(exprSrc string, data map[string]any) (*exec.Value, error) {
 	// ParseExpression alone expects the stream positioned just past a
 	// VariableBegin token (the state Parse() is in while walking a real
@@ -216,7 +251,7 @@ func (e *Engine) evalValue(exprSrc string, data map[string]any) (*exec.Value, er
 		},
 		Loader: e.loader,
 	}
-	val := evaluator.Eval(output.Expression)
+	val := evalOutput(evaluator, output)
 	if val.IsError() {
 		return nil, fmt.Errorf("template: evaluating expression %q: %s", exprSrc, val.Error())
 	}
