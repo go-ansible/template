@@ -179,3 +179,29 @@ func kwargBool(kwargs map[string]any, name string, def bool) bool {
 	}
 	return def
 }
+
+// Lookup runs a lookup plugin directly, as `with_<name>` needs: it is
+// the same call `lookup('<name>', ...)` makes from a template, with
+// wantlist forced on so the result is always the plugin's own list.
+//
+// It exists because with_* lives in the playbook engine rather than in
+// a template, and real resolves those two through exactly one path —
+// with_dict IS the dict lookup. Two paths would drift.
+func (e *Engine) Lookup(name string, terms []any, variables map[string]any, kwargs map[string]any) ([]any, error) {
+	fn, ok := e.lookups[normalizeLookupName(name)]
+	if !ok {
+		return nil, fmt.Errorf("no lookup plugin named %q", name)
+	}
+	if kwargs == nil {
+		kwargs = map[string]any{}
+	}
+	return fn(terms, variables, kwargs)
+}
+
+// HasLookup reports whether a lookup plugin of this name exists — what
+// the playbook parser needs to tell a `with_<known>` key apart from a
+// module whose name happens to start with "with_".
+func (e *Engine) HasLookup(name string) bool {
+	_, ok := e.lookups[normalizeLookupName(name)]
+	return ok
+}
