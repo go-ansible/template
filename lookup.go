@@ -24,6 +24,7 @@ func registerLookups(lookups map[string]lookupFunc) {
 	lookups["env"] = lookupEnv
 	lookups["pipe"] = lookupPipe
 	lookups["file"] = lookupFile
+	registerDataLookups(lookups)
 }
 
 // normalizeLookupName strips a known collection prefix, so
