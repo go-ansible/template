@@ -1752,3 +1752,28 @@ func TestToJSONFloats(t *testing.T) {
 		t.Errorf("ToJSON =\n%s\nwant\n%s", got, want)
 	}
 }
+
+// TestDict2ItemsIsDeterministic: a Go map's iteration order is
+// deliberately randomised, so `loop: "{{ d | dict2items }}"` printed
+// its iterations in a different order on about one run in eight — a
+// flake in the port's OWN output, which is worse than a divergence
+// because it gets blamed on everything else first.
+//
+// Repeated rather than checked once: a single pass of an unsorted map
+// passes most of the time, which is exactly how this survived.
+func TestDict2ItemsIsDeterministic(t *testing.T) {
+	e := New()
+	data := map[string]any{"d": map[string]any{
+		"zulu": 1, "alpha": 2, "mike": 3, "bravo": 4, "yankee": 5,
+	}}
+	want := "alpha,bravo,mike,yankee,zulu"
+	for i := 0; i < 50; i++ {
+		got, err := e.Render(`{{ d | dict2items | map(attribute='key') | join(',') }}`, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("run %d: %q, want %q", i, got, want)
+		}
+	}
+}

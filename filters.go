@@ -656,9 +656,24 @@ func filterDict2Items(e *exec.Evaluator, in *exec.Value, params *exec.VarArgs) *
 		valueName = params.Args[1].String()
 	}
 	m, _ := in.ToGoSimpleType(false).(map[string]any)
+	// SORTED, because a Go map's iteration order is deliberately
+	// random: `loop: "{{ d | dict2items }}"` printed its iterations in
+	// a different order on ABOUT ONE RUN IN EIGHT, which is exactly
+	// the kind of flake that gets blamed on everything else first.
+	//
+	// Real preserves the dict's insertion order instead — a disclosed
+	// divergence this port cannot close without an ordered map through
+	// the whole variable pipeline, and the same one the dict lookup
+	// and PythonRepr carry. Sorting at least makes it DETERMINISTIC,
+	// and identical to real whenever the document was in key order.
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
 	out := make([]any, 0, len(m))
-	for k, v := range m {
-		out = append(out, map[string]any{keyName: k, valueName: v})
+	for _, k := range keys {
+		out = append(out, map[string]any{keyName: k, valueName: m[k]})
 	}
 	return exec.AsValue(out)
 }
