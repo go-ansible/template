@@ -8,7 +8,9 @@
 package template
 
 import (
+	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/nikolalohinski/gonja/v2/builtins"
@@ -61,6 +63,11 @@ func (e *Engine) JinjaStringEscapes() *Engine {
 
 func New() *Engine {
 	cfg := config.New()
+	// Real Ansible treats an undefined variable as an ERROR, everywhere
+	// — a module argument, a string with one interpolated into it, a
+	// when:. This port rendered it as null, so a misspelled variable
+	// name silently did the wrong thing instead of stopping the play.
+	cfg.StrictUndefined = true
 	cfg.KeepTrailingNewline = true
 
 	filters := exec.NewFilterSet(map[string]exec.FilterFunction{}).Update(builtins.Filters)
@@ -72,7 +79,17 @@ func New() *Engine {
 	// "omit" is Ansible's own sentinel global — {{ x | default(omit) }}
 	// evaluates to Omit when x is undefined, and RenderValue drops the
 	// containing map key or list item for it (see omit.go).
-	globals := exec.NewContext(map[string]any{"omit": Omit})
+	// "none"/"None" are LITERALS in Jinja2, but gonja resolves them as
+	// ordinary names — so under StrictUndefined they read as undefined
+	// variables and `{{ none | type_debug }}` failed where real gives
+	// "NoneType". Binding them makes them values again. Real accepts
+	// all six spellings of the three literals; true/false/True/False
+	// gonja already parses itself.
+	globals := exec.NewContext(map[string]any{
+		"omit": Omit,
+		"none": nil,
+		"None": nil,
+	})
 
 	env := &exec.Environment{
 		Context:           exec.EmptyContext().Update(builtins.GlobalFunctions).Update(builtins.GlobalVariables).Update(globals),
@@ -137,7 +154,7 @@ func (e *Engine) Render(src string, data map[string]any) (string, error) {
 	}
 	out, err := tpl.ExecuteToString(e.callContext(data))
 	if err != nil {
-		return "", fmt.Errorf("template: rendering: %w", err)
+		return "", ansibleUndefinedWording(fmt.Errorf("template: rendering: %w", err))
 	}
 	return out, nil
 }
@@ -148,7 +165,7 @@ func (e *Engine) Render(src string, data map[string]any) (string, error) {
 func (e *Engine) Eval(exprSrc string, data map[string]any) (any, error) {
 	val, err := e.evalValue(exprSrc, data)
 	if err != nil {
-		return nil, err
+		return nil, ansibleUndefinedWording(err)
 	}
 	return val.ToGoSimpleType(false), nil
 }
@@ -158,7 +175,7 @@ func (e *Engine) Eval(exprSrc string, data map[string]any) (any, error) {
 func (e *Engine) EvalBool(exprSrc string, data map[string]any) (bool, error) {
 	val, err := e.evalValue(exprSrc, data)
 	if err != nil {
-		return false, err
+		return false, ansibleUndefinedWording(err)
 	}
 	return val.IsTrue(), nil
 }
@@ -269,4 +286,26 @@ func (e *Engine) renderValue(raw any, data map[string]any) (any, error) {
 	default:
 		return raw, nil
 	}
+}
+
+// undefinedNamePattern matches gonja's own wording for a name that is
+// not in scope.
+var undefinedNamePattern = regexp.MustCompile(`Unable to evaluate name "([^"]*)"`)
+
+// ansibleUndefinedWording rewrites gonja's message for an undefined
+// name into real Ansible's — "'x' is undefined" — which is the phrase
+// a playbook author recognises and greps for. Everything around it
+// stays gonja's: this port does not reproduce real's whole
+// "Finalization of task args for 'ansible.builtin.debug' failed"
+// chain, which names the module and the argument.
+func ansibleUndefinedWording(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	fixed := undefinedNamePattern.ReplaceAllString(msg, "'$1' is undefined")
+	if fixed == msg {
+		return err
+	}
+	return errors.New(fixed)
 }

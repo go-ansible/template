@@ -2,6 +2,7 @@ package template
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -421,5 +422,50 @@ func TestIsTemplate(t *testing.T) {
 	}
 	if IsTemplate("plain string") {
 		t.Error("plain string should not be a template")
+	}
+}
+
+// TestUndefinedIsAnError pins the strictness real Ansible has and this
+// port did not: an undefined variable is an ERROR, in an expression,
+// inside text, and through an attribute — not a silent null. A
+// misspelled variable name used to render as nothing and let the task
+// succeed.
+func TestUndefinedIsAnError(t *testing.T) {
+	e := New()
+	for _, expr := range []string{"nosuchvar", "nosuchvar.sub", "nosuchvar[0]"} {
+		if _, err := e.Eval(expr, nil); err == nil {
+			t.Errorf("Eval(%q) succeeded, want an undefined error", expr)
+		} else if !strings.Contains(err.Error(), "'nosuchvar' is undefined") {
+			t.Errorf("Eval(%q) error = %q, want real's \"'nosuchvar' is undefined\" wording", expr, err)
+		}
+	}
+	if _, err := e.Render("value is {{ nosuchvar }}", nil); err == nil {
+		t.Error("Render with an undefined name succeeded, want an error")
+	} else if !strings.Contains(err.Error(), "'nosuchvar' is undefined") {
+		t.Errorf("Render error = %q, want real's wording", err)
+	}
+	// The guard real playbooks use must keep working.
+	got, err := e.Render("{{ nosuchvar | default('fallback') }}", nil)
+	if err != nil || got != "fallback" {
+		t.Errorf("default() guard = %q, %v; want \"fallback\", nil", got, err)
+	}
+}
+
+// TestNoneIsALiteralNotAnUndefinedName: gonja resolves none/None as
+// ordinary names, so turning on strict undefined made
+// `{{ none | type_debug }}` fail where real gives "NoneType". All six
+// literal spellings real accepts are checked.
+func TestNoneIsALiteralNotAnUndefinedName(t *testing.T) {
+	e := New()
+	for _, tc := range []struct{ expr, want string }{
+		{"{{ none | type_debug }}", "NoneType"},
+		{"{{ None | type_debug }}", "NoneType"},
+		{"{{ none | ternary('T','F','N') }}", "N"},
+		{"{{ true }}/{{ True }}/{{ false }}/{{ False }}", "True/True/False/False"},
+	} {
+		got, err := e.Render(tc.expr, nil)
+		if err != nil || got != tc.want {
+			t.Errorf("Render(%q) = %q, %v; want %q", tc.expr, got, err, tc.want)
+		}
 	}
 }
