@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	osexec "os/exec"
+	"path/filepath"
 	"strings"
 	"unicode"
 )
@@ -75,13 +76,19 @@ func lookupPipe(terms []any, _ map[string]any, _ map[string]any) ([]any, error) 
 // search path at all yet, so a relative term here resolves against the
 // process's working directory only — a real, disclosed gap rather than a
 // silently different resolution.
-func lookupFile(terms []any, _ map[string]any, kwargs map[string]any) ([]any, error) {
+func lookupFile(terms []any, variables map[string]any, kwargs map[string]any) ([]any, error) {
 	rstrip := kwargBool(kwargs, "rstrip", true)
 	lstrip := kwargBool(kwargs, "lstrip", false)
 
 	out := make([]any, 0, len(terms))
 	for _, term := range terms {
-		path := fmt.Sprintf("%v", term)
+		name := fmt.Sprintf("%v", term)
+		path, ok := findInSearchPath(variables, "files", name)
+		if !ok {
+			// Real's own wording, so a playbook that greps its output
+			// for this reads the same thing either way.
+			return nil, fmt.Errorf("Unable to access the file %q: File not found. Use -vvvvv to see paths searched.", name)
+		}
 		content, err := os.ReadFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("unable to access the file %q: %w", path, err)
@@ -96,4 +103,72 @@ func lookupFile(terms []any, _ map[string]any, kwargs map[string]any) ([]any, er
 		out = append(out, text)
 	}
 	return out, nil
+}
+
+// findInSearchPath resolves a relative lookup argument the way real's
+// LookupBase.find_file_in_search_path does: for each directory in the
+// task's ansible_search_path, try <dir>/<subdir>/<name> and then
+// <dir>/<name>, first hit wins.
+//
+// Measured against real for a task inside a role, with the same file in
+// four places at once: <role>/files, then <role>, then
+// <playbook_dir>/files, then <playbook_dir>. The WORKING DIRECTORY is
+// not searched -- with the file present only there, real fails. This
+// port used to resolve against the working directory and nothing else,
+// so it read files real would not and missed the ones real would.
+//
+// With no search path in scope -- this package used on its own, outside
+// a playbook -- the name is used as given, which is the only thing left
+// to do and what the package did before.
+func findInSearchPath(variables map[string]any, subdir, name string) (string, bool) {
+	if filepath.IsAbs(name) {
+		return name, fileExists(name)
+	}
+	dirs := searchPathDirs(variables)
+	if len(dirs) == 0 {
+		return name, fileExists(name)
+	}
+	for _, dir := range dirs {
+		for _, candidate := range []string{
+			filepath.Join(dir, subdir, name),
+			filepath.Join(dir, name),
+		} {
+			if fileExists(candidate) {
+				return candidate, true
+			}
+		}
+	}
+	return "", false
+}
+
+// searchPathDirs reads ansible_search_path, which the playbook engine
+// sets per task. It tolerates the shapes a variable can arrive in --
+// []any is what comes back through a template context, []string what a
+// Go caller would write.
+func searchPathDirs(variables map[string]any) []string {
+	var out []string
+	switch v := variables["ansible_search_path"].(type) {
+	case []any:
+		for _, e := range v {
+			if s, ok := e.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+	case []string:
+		for _, s := range v {
+			if s != "" {
+				out = append(out, s)
+			}
+		}
+	case string:
+		if v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func fileExists(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir()
 }
