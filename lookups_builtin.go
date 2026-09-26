@@ -87,7 +87,7 @@ func lookupFile(terms []any, variables map[string]any, kwargs map[string]any) ([
 		if !ok {
 			// Real's own wording, so a playbook that greps its output
 			// for this reads the same thing either way.
-			return nil, fmt.Errorf("Unable to access the file %q: File not found. Use -vvvvv to see paths searched.", name)
+			return nil, fmt.Errorf("Unable to access the file '%s': File not found. Use -vvvvv to see paths searched.", name)
 		}
 		content, err := os.ReadFile(path)
 		if err != nil {
