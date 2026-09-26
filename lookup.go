@@ -130,7 +130,13 @@ func (e *Engine) invokeLookup(variables map[string]any, params *exec.VarArgs, fo
 				e.OnWarning(fmt.Sprintf("An error occurred while running the lookup plugin %q: %v", name, err))
 			}
 		default: // strict
-			return exec.ValueError(fmt.Errorf("lookup %q: %w", name, err))
+			// Real's own wording, and deliberately self-identifying:
+			// gonja wraps whatever comes out of a global function in
+			// several layers of its own prose, and the playbook engine
+			// finds the part real would have printed by looking for
+			// this prefix. A boundary is checkable; a list of patterns
+			// to strip is not.
+			return exec.ValueError(fmt.Errorf("The lookup plugin '%s' failed: %w", name, err))
 		}
 		if wantlist {
 			return exec.AsValue([]any{})

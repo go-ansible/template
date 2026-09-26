@@ -3,6 +3,7 @@ package template
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -130,8 +131,27 @@ func TestFileLookupMissingFileUsesRealsWording(t *testing.T) {
 	if err == nil {
 		t.Fatal("no error")
 	}
-	want := `Unable to access the file "nope.txt": File not found. Use -vvvvv to see paths searched.`
+	want := `Unable to access the file 'nope.txt': File not found. Use -vvvvv to see paths searched.`
 	if err.Error() != want {
 		t.Errorf("err = %q\nwant %q", err.Error(), want)
+	}
+}
+
+// A strict lookup failure names the plugin the way real does. The
+// prefix is load-bearing: the playbook engine finds the part real would
+// have printed by looking for it, because gonja wraps a global
+// function's error in several layers of its own prose.
+func TestStrictLookupFailureUsesRealsPrefix(t *testing.T) {
+	e := New()
+	_, err := e.Eval(`lookup('file', 'definitely-not-here.txt')`, map[string]any{
+		"ansible_search_path": []any{t.TempDir()},
+	})
+	if err == nil {
+		t.Fatal("no error")
+	}
+	const want = "The lookup plugin 'file' failed: Unable to access the file " +
+		"'definitely-not-here.txt': File not found. Use -vvvvv to see paths searched."
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("err = %q\ndoes not contain %q", err.Error(), want)
 	}
 }
