@@ -5,7 +5,7 @@ go 1.26.4
 require (
 	github.com/go-encryptions/unixcrypt v0.1.0
 	github.com/go-regexp/engine v0.1.3
-	github.com/nikolalohinski/gonja/v2 v2.9.0
+	github.com/nikolalohinski/gonja/v2 v2.9.1
 	gopkg.in/yaml.v3 v3.0.1
 )
 
