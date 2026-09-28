@@ -229,14 +229,38 @@ func TestMandatoryFilter(t *testing.T) {
 		t.Fatalf("mandatory(set) = %#v", got)
 	}
 
-	_, err = e.Eval(`x | mandatory`, map[string]any{"x": nil})
-	if err == nil {
-		t.Fatal("mandatory(nil): got nil error, want one")
+	// A NULL passes through. This test used to assert the opposite,
+	// having written nil for "unset" -- which is exactly the
+	// conflation nulls.go exists to undo. Measured against
+	// ansible-core 2.21.4: `got={{ nullvar | mandatory }}.` renders
+	// "got=." and the task succeeds, with or without a custom message.
+	for _, expr := range []string{`x | mandatory`, `x | mandatory('custom message')`} {
+		got, err := e.Eval(expr, map[string]any{"x": nil})
+		if err != nil {
+			t.Errorf("%s over a null: %v -- real passes a null through", expr, err)
+		}
+		if got != nil {
+			t.Errorf("%s over a null = %#v, want nil", expr, got)
+		}
 	}
 
-	_, err = e.Eval(`x | mandatory('custom message')`, map[string]any{"x": nil})
-	if err == nil {
-		t.Fatal("mandatory(nil, custom message): got nil error, want one")
+	// An UNDEFINED is what it refuses, and real names it:
+	// "Mandatory variable 'no_such' not defined." -- for a missing
+	// attribute too: "Mandatory variable 'absent' not defined."
+	for _, tc := range []struct{ expr, want string }{
+		{`no_such | mandatory`, "Mandatory variable 'no_such' not defined."},
+		{`d.absent | mandatory`, "Mandatory variable 'absent' not defined."},
+		{`no_such | mandatory('custom message')`, "custom message"},
+		{`no_such | mandatory(msg='kw message')`, "kw message"},
+	} {
+		_, err := e.Eval(tc.expr, map[string]any{"d": map[string]any{"a": 1}})
+		if err == nil {
+			t.Errorf("%s: got nil error, want one", tc.expr)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s:\n got %v\nwant a message containing %q (real's own)", tc.expr, err, tc.want)
+		}
 	}
 }
 
