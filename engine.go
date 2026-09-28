@@ -75,6 +75,10 @@ func New() *Engine {
 
 	tests := exec.NewTestSet(map[string]exec.TestFunction{}).Update(builtins.Tests)
 	registerTests(tests)
+	// LAST, so these win over both gonja's builtins and this package's
+	// own registrations -- see nulls.go for why a null must not read
+	// as an undefined.
+	registerNullAwareOverrides(filters, tests)
 
 	// "omit" is Ansible's own sentinel global — {{ x | default(omit) }}
 	// evaluates to Omit when x is undefined, and RenderValue drops the
