@@ -26,6 +26,7 @@ func registerLookups(lookups map[string]lookupFunc) {
 	lookups["pipe"] = lookupPipe
 	lookups["file"] = lookupFile
 	lookups["fileglob"] = lookupFileglob
+	lookups["first_found"] = lookupFirstFound
 	lookups["lines"] = lookupLines
 	lookups["random_choice"] = lookupRandomChoice
 	lookups["varnames"] = lookupVarnames
