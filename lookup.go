@@ -1,6 +1,7 @@
 package template
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -24,6 +25,10 @@ func registerLookups(lookups map[string]lookupFunc) {
 	lookups["env"] = lookupEnv
 	lookups["pipe"] = lookupPipe
 	lookups["file"] = lookupFile
+	lookups["fileglob"] = lookupFileglob
+	lookups["lines"] = lookupLines
+	lookups["random_choice"] = lookupRandomChoice
+	lookups["varnames"] = lookupVarnames
 	registerDataLookups(lookups)
 }
 
@@ -130,6 +135,14 @@ func (e *Engine) invokeLookup(variables map[string]any, params *exec.VarArgs, fo
 				e.OnWarning(fmt.Sprintf("An error occurred while running the lookup plugin %q: %v", name, err))
 			}
 		default: // strict
+			// An undefined VALUE is not a plugin failure, and real does
+			// not name the plugin for one: measured, a missing name
+			// through the vars lookup reports only "No variable named
+			// 'x' was found." See errUndefinedVar.
+			var undef errUndefinedVar
+			if errors.As(err, &undef) {
+				return exec.ValueError(err)
+			}
 			// Real's own wording, and deliberately self-identifying:
 			// gonja wraps whatever comes out of a global function in
 			// several layers of its own prose, and the playbook engine

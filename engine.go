@@ -102,12 +102,16 @@ func New() *Engine {
 	lookups := map[string]lookupFunc{}
 	registerLookups(lookups)
 
-	return &Engine{
+	e := &Engine{
 		cfg:     cfg,
 		env:     env,
 		loader:  loaders.MustNewMemoryLoader(map[string]string{}),
 		lookups: lookups,
 	}
+	// These need the Engine itself, so they are installed once it
+	// exists rather than in registerLookups.
+	e.registerEngineLookups()
+	return e
 }
 
 // IsTemplate reports whether s contains any Jinja2 delimiter ({{, {%, or
