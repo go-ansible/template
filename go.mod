@@ -1,6 +1,6 @@
 module github.com/go-ansible/template
 
-go 1.26.4
+go 1.27.1
 
 require (
 	github.com/go-encryptions/unixcrypt v0.1.0
