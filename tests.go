@@ -25,6 +25,8 @@ func registerTests(tests *exec.TestSet) {
 	must("failure", testResultStatus(false))
 	must("skipped", testResultFlag("skipped"))
 	must("version", testVersion)
+
+	registerMoreTests(must)
 }
 
 // testResultFlag builds a test for a registered task result's boolean
