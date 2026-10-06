@@ -61,6 +61,17 @@ func (e *Engine) JinjaStringEscapes() *Engine {
 	return e
 }
 
+// RegisterFilter adds a custom filter callable from any template rendered
+// by this engine, like Ansible's filter plugins. Filters resolve by name
+// at each application, so a registration is visible to subsequent filter
+// uses -- including inside an already started Render/Eval. Register before
+// rendering begins for deterministic behaviour. Registering an existing
+// name (built-ins, Ansible's library, the null-aware overrides) returns
+// an error instead of replacing it.
+func (e *Engine) RegisterFilter(name string, fn exec.FilterFunction) error {
+	return e.env.Filters.Register(name, fn)
+}
+
 func New() *Engine {
 	cfg := config.New()
 	// Real Ansible treats an undefined variable as an ERROR, everywhere
