@@ -3,8 +3,8 @@ module github.com/go-ansible/template
 go 1.27.1
 
 require (
-	github.com/go-encryptions/unixcrypt v0.1.0
-	github.com/go-regexp/engine v0.1.3
+	github.com/go-encryptions/unixcrypt v0.2.0
+	github.com/go-regexp/engine v0.3.0
 	github.com/nikolalohinski/gonja/v2 v2.9.1
 	gopkg.in/yaml.v3 v3.0.1
 )
