@@ -72,6 +72,42 @@ func (e *Engine) RegisterFilter(name string, fn exec.FilterFunction) error {
 	return e.env.Filters.Register(name, fn)
 }
 
+// TestFunc is the shape a custom Jinja test must have: it receives the
+// value on the left of `is`, the test's own arguments, and answers true
+// or false.
+//
+// It is spelled out here rather than reusing gonja's own exec.TestFunction
+// because that one is `any` -- gonja widened it to accept a legacy
+// first argument of *exec.Context as well as *exec.Evaluator, and the
+// shape is then checked by reflection at registration time. Taking `any`
+// would mean a caller learns about a wrong signature from an error value
+// at run time, where RegisterFilter's gonja type (a real func type) lets
+// the compiler say so. A new API should not inherit someone else's
+// backwards compatibility, so this one is typed and every test in this
+// package already has this shape.
+type TestFunc func(*exec.Evaluator, *exec.Value, *exec.VarArgs) (bool, error)
+
+// RegisterTest adds a custom test callable as `x is name` in any template
+// rendered by this engine, like Ansible's test plugins -- the companion
+// to RegisterFilter, since Ansible extends Jinja2 with both and this
+// engine's test set was assembled inside New() behind the same unexported
+// field.
+//
+// The same rules as RegisterFilter: registration is per-engine (New
+// builds a fresh set rather than sharing the package-level one), tests
+// resolve by name at each application, and an existing name -- a
+// built-in, Ansible's own library -- returns an error instead of being
+// replaced. Register before rendering begins.
+//
+// ⚠ gonja's Register is synchronized per call but NOT atomic: it asks
+// Exists, which takes and releases the lock, and only then takes the lock
+// again to write. Two goroutines registering the same name can both pass
+// that check. Registering from one goroutine before rendering starts is
+// the contract, not merely the advice.
+func (e *Engine) RegisterTest(name string, fn TestFunc) error {
+	return e.env.Tests.Register(name, exec.TestFunction(fn))
+}
+
 func New() *Engine {
 	cfg := config.New()
 	// Real Ansible treats an undefined variable as an ERROR, everywhere
