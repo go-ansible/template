@@ -284,7 +284,7 @@ func (e *Engine) evalValue(exprSrc string, data map[string]any) (*exec.Value, er
 		data = withRawLiterals(data, rawConsts)
 	}
 
-	stream := tokens.Lex(lifted, e.cfg)
+	stream := tokens.LexAll(lifted, e.cfg)
 	p := parser.NewParser("<expr>", stream, e.cfg, e.loader, e.env.ControlStructures)
 	node, err := p.ParseExpressionNode()
 	if err != nil {
