@@ -10,8 +10,8 @@ github.com/go-encryptions/unixcrypt v0.2.0 h1:y7jPRn7D22dKkAS54XF+IndhCw0Vyf4uoE
 github.com/go-encryptions/unixcrypt v0.2.0/go.mod h1:b9Ng6kn/dLtVXduigJ5Lc3rcpaWaiYVYRilBn+n4VaE=
 github.com/go-logr/logr v1.4.2 h1:6pFjapn8bFcIbiKo3XT4j/BhANplGihG6tvd+8rYgrY=
 github.com/go-logr/logr v1.4.2/go.mod h1:9T104GzyrTigFIr8wt5mBrctHMim0Nb2HLGrmQ40KvY=
-github.com/go-regexp/engine v0.3.0 h1:yoJ9GtIr5YloEuQQ3bb7jjD0Qzmh+Exi+f6CUwBT8H8=
-github.com/go-regexp/engine v0.3.0/go.mod h1:fWnPvSuE4HIVpBQIHMiaPMEE7InDc00KeoPr/QNFGwA=
+github.com/go-regexp/engine v0.3.2 h1:zublnb1Vf5Cclh59+cp35htv2aATddBMNp5VwMAeZcc=
+github.com/go-regexp/engine v0.3.2/go.mod h1:fWnPvSuE4HIVpBQIHMiaPMEE7InDc00KeoPr/QNFGwA=
 github.com/go-task/slim-sprig/v3 v3.0.0 h1:sUs3vkvUymDpBKi3qH1YSqBQk9+9D/8M2mN1vB6EwHI=
 github.com/go-task/slim-sprig/v3 v3.0.0/go.mod h1:W848ghGpv3Qj3dhTPRyJypKRiqCdHZiAzKg9hl15HA8=
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
