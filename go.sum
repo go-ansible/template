@@ -6,8 +6,8 @@ github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
 github.com/dustin/go-humanize v1.0.1/go.mod h1:Mu1zIs6XwVuF/gI1OepvI0qD18qycQx+mFykh5fBlto=
-github.com/go-encryptions/unixcrypt v0.2.1 h1:pNl9GALnB16NzMXNOHtcvnuJVpWmIFy9mD9p0oywaV8=
-github.com/go-encryptions/unixcrypt v0.2.1/go.mod h1:Ww0M05XzQfqbtMXo6pn6qupeDOVF9WvJ6js43AMuo7U=
+github.com/go-encryptions/unixcrypt v0.3.1 h1:gg0HfvhWArWylgEqEILeVb8DGAilpXBF4X4yHWJMT+w=
+github.com/go-encryptions/unixcrypt v0.3.1/go.mod h1:Ww0M05XzQfqbtMXo6pn6qupeDOVF9WvJ6js43AMuo7U=
 github.com/go-logr/logr v1.4.2 h1:6pFjapn8bFcIbiKo3XT4j/BhANplGihG6tvd+8rYgrY=
 github.com/go-logr/logr v1.4.2/go.mod h1:9T104GzyrTigFIr8wt5mBrctHMim0Nb2HLGrmQ40KvY=
 github.com/go-regexp/engine v0.4.2 h1:oI69hZyQyZH2n5w0UI7UEO7CaTa7hy3VSgKo76EJB4g=
